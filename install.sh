@@ -550,6 +550,17 @@ install_dashboard_helper() {
   chmod +x /usr/local/bin/quip-dashboard
 }
 
+install_dashboard_identity_sync() {
+  log "Menginstall sinkronisasi address dashboard..."
+  curl -fsSL "${ONECLICK_RAW_BASE}/quip-dashboard-sync.sh" -o /usr/local/bin/quip-dashboard-sync
+  chmod +x /usr/local/bin/quip-dashboard-sync
+  cat > /etc/cron.d/quip-dashboard-sync <<EOF
+*/5 * * * * root QUIP_INSTALL_DIR="${INSTALL_DIR}" /usr/local/bin/quip-dashboard-sync >> /var/log/quip-dashboard-sync.log 2>&1
+EOF
+  chmod 0644 /etc/cron.d/quip-dashboard-sync
+  QUIP_INSTALL_DIR="${INSTALL_DIR}" /usr/local/bin/quip-dashboard-sync || true
+}
+
 create_screen_helpers() {
   if [[ "${ENABLE_SCREEN}" != "yes" ]]; then
     return
@@ -611,6 +622,7 @@ print_summary() {
   echo "  docker compose logs --tail=200 -f quip-validator"
   echo "  docker compose logs --tail=200 -f quip-bootstrap"
   echo "  quip-dashboard     # dashboard status + logs, refresh tiap 5 detik"
+  echo "  quip-dashboard-sync # sinkronkan Connected Node dengan miner lokal"
   echo "  bash ./cron.sh"
   if [[ "${ENABLE_SCREEN}" == "yes" ]]; then
     echo "  quip-logs          # buka logs di screen"
@@ -636,6 +648,7 @@ main() {
   remove_legacy_pm2_watchdog
   install_dashboard_helper
   start_node
+  install_dashboard_identity_sync
   install_cron_update
   create_screen_helpers
   print_summary

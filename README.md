@@ -360,7 +360,9 @@ cd /opt/quip-node
 docker compose logs --tail=200 quip-bootstrap
 ```
 
-Kalau address `Connected Node` di dashboard berbeda dengan `ss58 address` hasil bootstrap, cek address miner lokal:
+Installer memasang `quip-dashboard-sync` untuk menyamakan address `Connected Node` dengan miner lokal secara otomatis setiap lima menit. Address dibaca langsung dari REST miner pada VPS tersebut, bukan ditulis tetap di tutorial.
+
+Kalau address dashboard belum sesuai, cek address miner lokal:
 
 ```bash
 cd /opt/quip-node
@@ -368,19 +370,16 @@ docker exec quip-cpu python3 -c \
   'import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://127.0.0.1:80/api/v1/status")), indent=2))'
 ```
 
-Untuk deployment CPU, arahkan ulang dashboard ke miner dan validator lokal lalu hapus cache pointer address dashboard:
+Pasang atau perbarui helper, lalu jalankan sinkronisasi:
 
 ```bash
-cd /opt/quip-node
-grep -q '^QUIP_VALIDATOR_RPC_URLS=' .env && sed -i 's|^QUIP_VALIDATOR_RPC_URLS=.*|QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944|' .env || echo 'QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944' >> .env
-grep -q '^QUIP_NODE_URL=' .env && sed -i 's|^QUIP_NODE_URL=.*|QUIP_NODE_URL=http://quip-miner:80|' .env || echo 'QUIP_NODE_URL=http://quip-miner:80' >> .env
-grep -q '^QUIP_VALIDATOR_RPC_URL=' .env && sed -i 's|^QUIP_VALIDATOR_RPC_URL=.*|QUIP_VALIDATOR_RPC_URL=ws://quip-validator:9944|' .env || echo 'QUIP_VALIDATOR_RPC_URL=ws://quip-validator:9944' >> .env
-docker compose exec -T postgres psql -U quip -d quip -c "DELETE FROM meta WHERE key = 'self_address';"
-docker compose --profile cpu up -d --force-recreate dashboard
-docker compose logs --tail=100 -f dashboard
+curl -fsSL https://raw.githubusercontent.com/skyhazee/QuipNetwork-Oneclick/main/quip-dashboard-sync.sh \
+  -o /usr/local/bin/quip-dashboard-sync
+chmod +x /usr/local/bin/quip-dashboard-sync
+quip-dashboard-sync
 ```
 
-Perintah SQL tersebut hanya menghapus pointer address milik indexer dashboard. Keystore miner dan saldo account tidak dihapus.
+Helper hanya memperbarui pointer address dashboard dan menyimpan `QUIP_OPERATOR_ACCOUNT` hasil deteksi lokal ke `.env`. Keystore miner, saldo account, validator, dan proses mining tidak direstart.
 
 ## File Penting
 
