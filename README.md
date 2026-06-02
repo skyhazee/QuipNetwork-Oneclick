@@ -384,19 +384,45 @@ Perintah SQL tersebut hanya menghapus pointer address milik indexer dashboard. K
 
 ## File Penting
 
-Backup file ini setelah install atau upgrade:
+Backup file berikut setelah install atau upgrade. Simpan arsip di perangkat lain yang aman karena `keystore.json`, `.env`, mnemonic, dan file signing dapat berisi secret:
 
 ```text
-/opt/quip-node/data/config.toml
-/opt/quip-node/data/keystore.json
-/opt/quip-node/.env
+/opt/quip-node/data/keystore.json    Wajib: signer miner dan address SS58
+/opt/quip-node/data/config.toml      Wajib: konfigurasi miner
+/opt/quip-node/.env                  Wajib: domain, tag image, dan konfigurasi deployment
 ```
 
-Untuk node hasil migrasi, simpan juga:
+Simpan juga file berikut jika tersedia:
 
 ```text
+/opt/quip-node/data/node-key         Identitas libp2p validator
+/opt/quip-node/data/signing.json     Material signing tambahan
+/opt/quip-node/data/*.mnemonic       Mnemonic jika pernah dibuat manual
 /opt/quip-node/data/.v0.1_backup/
 /opt/quip-node/.env.v0.1_backup
+```
+
+Contoh membuat arsip backup dengan permission privat:
+
+```bash
+cd /opt/quip-node
+umask 077
+tar --ignore-failed-read -czf "$HOME/quip-node-backup-$(date +%F).tar.gz" \
+  .env .env.v0.1_backup \
+  data/config.toml data/keystore.json data/node-key data/signing.json \
+  data/*.mnemonic data/.v0.1_backup
+```
+
+Pindahkan arsip tersebut ke perangkat lain, lalu hapus salinan arsip dari VPS jika sudah tidak diperlukan.
+
+Folder berikut berukuran besar dan umumnya tidak perlu masuk backup rutin karena dapat dibuat ulang atau disinkronkan ulang:
+
+```text
+/opt/quip-node/data/validator-data/
+/opt/quip-node/dashboard-data/
+Docker volume quip-pgdata
+Docker volume quip-caddy-data
+Docker volume quip-caddy-config
 ```
 
 ## Disclaimer
