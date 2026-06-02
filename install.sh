@@ -461,7 +461,6 @@ configure_node() {
     cp env.example .env
   fi
 
-  unset_env "QUIP_NODE_URL"
   unset_env "QUIP_NODE_TOKEN"
   unset_env "DASHBOARD_PORT"
   set_env "PUID" "$(id -u "${RUN_USER}")"
@@ -470,6 +469,11 @@ configure_node() {
   set_env "QUIP_MINER_TAG" "v0.2"
   set_env "QUIP_DASHBOARD_TAG" "v0.2"
   set_env "QUIP_VALIDATOR_TAG" "v0.2"
+  set_env "QUIP_VALIDATOR_RPC_URLS" "ws://quip-validator:9944"
+  # Compatibility for rolling v0.2 dashboard images that still consume the
+  # previous REST URL and singular validator RPC variables.
+  set_env "QUIP_NODE_URL" "http://quip-miner:80"
+  set_env "QUIP_VALIDATOR_RPC_URL" "ws://quip-validator:9944"
 
   if [[ "${ENABLE_TLS}" == "yes" ]]; then
     set_env "QUIP_HOSTNAME" "${DASHBOARD_DOMAIN}, ${DASHBOARD_DOMAIN}:${API_PORT}"

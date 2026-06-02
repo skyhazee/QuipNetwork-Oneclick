@@ -43,6 +43,7 @@ Installer akan otomatis:
 - Menjalankan converter resmi untuk `data/config.toml` dan `.env`.
 - Menyimpan backup data lama.
 - Mengubah format domain Caddy untuk HTTPS v0.2.
+- Menulis env dashboard resmi dan env kompatibilitas untuk image v0.2 yang masih dalam masa transisi.
 - Membuka port firewall baru dan menghapus rule UDP `20049` lama.
 - Menjalankan miner, validator, dashboard, Postgres, Caddy, dan bootstrap otomatis.
 
@@ -358,6 +359,28 @@ Kalau miner belum berjalan setelah upgrade:
 cd /opt/quip-node
 docker compose logs --tail=200 quip-bootstrap
 ```
+
+Kalau address `Connected Node` di dashboard berbeda dengan `ss58 address` hasil bootstrap, cek address miner lokal:
+
+```bash
+cd /opt/quip-node
+docker exec quip-cpu python3 -c \
+  'import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://127.0.0.1:80/api/v1/status")), indent=2))'
+```
+
+Untuk deployment CPU, arahkan ulang dashboard ke miner dan validator lokal lalu hapus cache pointer address dashboard:
+
+```bash
+cd /opt/quip-node
+grep -q '^QUIP_VALIDATOR_RPC_URLS=' .env && sed -i 's|^QUIP_VALIDATOR_RPC_URLS=.*|QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944|' .env || echo 'QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944' >> .env
+grep -q '^QUIP_NODE_URL=' .env && sed -i 's|^QUIP_NODE_URL=.*|QUIP_NODE_URL=http://quip-miner:80|' .env || echo 'QUIP_NODE_URL=http://quip-miner:80' >> .env
+grep -q '^QUIP_VALIDATOR_RPC_URL=' .env && sed -i 's|^QUIP_VALIDATOR_RPC_URL=.*|QUIP_VALIDATOR_RPC_URL=ws://quip-validator:9944|' .env || echo 'QUIP_VALIDATOR_RPC_URL=ws://quip-validator:9944' >> .env
+docker compose exec -T postgres psql -U quip -d quip -c "DELETE FROM meta WHERE key = 'self_address';"
+docker compose --profile cpu up -d --force-recreate dashboard
+docker compose logs --tail=100 -f dashboard
+```
+
+Perintah SQL tersebut hanya menghapus pointer address milik indexer dashboard. Keystore miner dan saldo account tidak dihapus.
 
 ## File Penting
 
