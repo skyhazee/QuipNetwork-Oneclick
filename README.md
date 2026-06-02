@@ -155,7 +155,7 @@ http://IP_VPS:20049/
 Untuk HTTPS, installer menyimpan format Caddy v0.2 berikut di `.env`:
 
 ```text
-QUIP_HOSTNAME=quip.example.com,quip.example.com:20049
+QUIP_HOSTNAME=quip.example.com, quip.example.com:20049
 ```
 
 ## Firewall

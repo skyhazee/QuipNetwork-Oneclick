@@ -472,7 +472,7 @@ configure_node() {
   set_env "QUIP_VALIDATOR_TAG" "v0.2"
 
   if [[ "${ENABLE_TLS}" == "yes" ]]; then
-    set_env "QUIP_HOSTNAME" "${DASHBOARD_DOMAIN},${DASHBOARD_DOMAIN}:${API_PORT}"
+    set_env "QUIP_HOSTNAME" "${DASHBOARD_DOMAIN}, ${DASHBOARD_DOMAIN}:${API_PORT}"
     set_env "CERT_EMAIL" "${CERT_EMAIL}"
   else
     set_env "QUIP_HOSTNAME" ":${API_PORT}"
