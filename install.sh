@@ -3,8 +3,10 @@ set -Eeuo pipefail
 
 APP_NAME="quip-oneclick"
 DEPLOY_REPO="https://gitlab.com/quip.network/nodes.quip.network.git"
+DEPLOY_BRANCH="v0.2"
 INSTALL_DIR_DEFAULT="/opt/quip-node"
-DEFAULT_P2P_PORT="20049"
+API_PORT="20049"
+VALIDATOR_P2P_PORT="30333"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -26,7 +28,7 @@ require_linux() {
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    err "Jalankan sebagai root: sudo bash install.sh"
+    err "Jalankan sebagai root: sudo bash quip-install.sh"
     exit 1
   fi
 }
@@ -50,6 +52,19 @@ detect_user() {
   RUN_HOME="$(getent passwd "${RUN_USER}" | cut -d: -f6)"
 }
 
+read_prompt() {
+  local prompt="$1"
+  local value
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf "%s" "${prompt}" > /dev/tty
+    IFS= read -r value < /dev/tty
+  else
+    printf "%s" "${prompt}" >&2
+    IFS= read -r value
+  fi
+  printf "%s" "${value}"
+}
+
 prompt_default() {
   local prompt="$1"
   local default="$2"
@@ -65,19 +80,6 @@ prompt_optional() {
   printf "%s" "${value}"
 }
 
-read_prompt() {
-  local prompt="$1"
-  local value
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    printf "%s" "${prompt}" > /dev/tty
-    IFS= read -r value < /dev/tty
-  else
-    printf "%s" "${prompt}" >&2
-    IFS= read -r value
-  fi
-  printf "%s" "${value}"
-}
-
 confirm() {
   local prompt="$1"
   local default="${2:-Y}"
@@ -88,36 +90,6 @@ confirm() {
   answer="$(read_prompt "${prompt} ${suffix}: ")"
   answer="${answer:-$default}"
   [[ "${answer}" =~ ^[Yy]$ ]]
-}
-
-choose_mode() {
-  echo
-  echo "Pilih mode node:"
-  echo "  1) CPU mining (recommended untuk VPS biasa)"
-  echo "  2) CUDA GPU mining (butuh NVIDIA GPU + driver)"
-  echo "  3) QPU D-Wave (butuh DWAVE_API_KEY)"
-  choice="$(read_prompt "Pilihan [1]: ")"
-  case "${choice:-1}" in
-    1) NODE_MODE="cpu" ;;
-    2) NODE_MODE="cuda" ;;
-    3) NODE_MODE="qpu" ;;
-    *) warn "Pilihan tidak dikenal, pakai CPU."; NODE_MODE="cpu" ;;
-  esac
-}
-
-choose_profile() {
-  echo
-  echo "Pilih varian deployment:"
-  echo "  1) Full: node + dashboard + Caddy/TLS (recommended kalau punya domain)"
-  echo "  2) No TLS: node + dashboard tanpa Caddy"
-  echo "  3) No dashboard: node saja"
-  choice="$(read_prompt "Pilihan [1]: ")"
-  case "${choice:-1}" in
-    1) PROFILE="${NODE_MODE}" ;;
-    2) PROFILE="${NODE_MODE}-notls" ;;
-    3) PROFILE="${NODE_MODE}-nodash" ;;
-    *) warn "Pilihan tidak dikenal, pakai full profile."; PROFILE="${NODE_MODE}" ;;
-  esac
 }
 
 install_packages() {
@@ -157,145 +129,296 @@ install_docker() {
   systemctl enable --now docker
 }
 
-install_pm2_if_needed() {
-  if [[ "${ENABLE_PM2}" != "yes" ]]; then
-    return
-  fi
-
-  if command -v pm2 >/dev/null 2>&1; then
-    log "PM2 sudah tersedia."
-    return
-  fi
-
-  if ! command -v npm >/dev/null 2>&1; then
-    log "Menginstall Node.js/npm untuk PM2..."
-    apt-get install -y nodejs npm
-  fi
-
-  log "Menginstall PM2..."
-  npm install -g pm2
+get_env_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "${file}" ]] || return 0
+  sed -n "s/^${key}=//p" "${file}" | tail -n 1
 }
 
-clone_or_update_repo() {
-  log "Menyiapkan deployment repo di ${INSTALL_DIR}..."
-  mkdir -p "$(dirname "${INSTALL_DIR}")"
-
-  if [[ -d "${INSTALL_DIR}/.git" ]]; then
-    git -C "${INSTALL_DIR}" pull --ff-only
-  elif [[ -e "${INSTALL_DIR}" ]]; then
-    err "${INSTALL_DIR} sudah ada tapi bukan git repo. Pilih folder lain atau pindahkan folder tersebut."
-    exit 1
-  else
-    git clone "${DEPLOY_REPO}" "${INSTALL_DIR}"
-  fi
-}
-
-generate_secret() {
-  openssl rand -hex 32
-}
-
-configure_node() {
-  log "Membuat konfigurasi node..."
-  cd "${INSTALL_DIR}"
-
-  cp "data/config.${NODE_MODE}.toml" data/config.toml
-
-  local secret_value
-  if [[ -n "${NODE_SECRET}" ]]; then
-    secret_value="${NODE_SECRET}"
-  else
-    secret_value="$(generate_secret)"
-  fi
-
-  python3 - "$secret_value" "$PUBLIC_HOST" "$NODE_NAME" "$P2P_PORT" <<'PY'
+get_config_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "${file}" ]] || return 0
+  python3 - "${file}" "${key}" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-secret, public_host, node_name, p2p_port = sys.argv[1:5]
+text = Path(sys.argv[1]).read_text(errors="replace")
+key = re.escape(sys.argv[2])
+match = re.search(rf'(?m)^\s*{key}\s*=\s*"([^"]*)"\s*$', text)
+if match:
+    print(match.group(1))
+PY
+}
+
+normalise_domain() {
+  local value="$1"
+  value="${value%%,*}"
+  value="${value#http://}"
+  value="${value#https://}"
+  value="${value%%/*}"
+  value="${value%:20049}"
+  value="${value%:20080}"
+  printf "%s" "${value}"
+}
+
+is_public_domain() {
+  local value="$1"
+  [[ -n "${value}" ]] &&
+    [[ "${value}" != ":${API_PORT}" ]] &&
+    [[ "${value}" != "localhost" ]] &&
+    [[ "${value}" != "localhost:"* ]] &&
+    [[ "${value}" != "127.0.0.1" ]] &&
+    [[ "${value}" != *:* ]] &&
+    [[ ! "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] &&
+    [[ "${value}" == *.* ]]
+}
+
+detect_existing_install() {
+  EXISTING_INSTALL="no"
+  EXISTING_SCHEMA=""
+  EXISTING_VARIANT=""
+  EXISTING_NODE_NAME=""
+  EXISTING_PUBLIC_HOST=""
+  EXISTING_SECRET_PRESENT="no"
+  EXISTING_DOMAIN=""
+  EXISTING_CERT_EMAIL=""
+  EXISTING_DWAVE_API_KEY=""
+
+  if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
+    return
+  fi
+
+  EXISTING_INSTALL="yes"
+  local config="${INSTALL_DIR}/data/config.toml"
+  local env_file="${INSTALL_DIR}/.env"
+
+  if [[ -f "${config}" ]]; then
+    if grep -qE '^\s*\[miner\]\s*$' "${config}"; then
+      EXISTING_SCHEMA="v0.2"
+    elif grep -qE '^\s*\[global\]\s*$' "${config}"; then
+      if grep -qE '^\s*validators\s*=' "${config}"; then
+        EXISTING_SCHEMA="v0.2-template"
+      else
+        EXISTING_SCHEMA="v0.1"
+      fi
+    fi
+
+    EXISTING_NODE_NAME="$(get_config_value "${config}" "node_name")"
+    EXISTING_PUBLIC_HOST="$(get_config_value "${config}" "public_host")"
+    if [[ -n "$(get_config_value "${config}" "secret")" ]]; then
+      EXISTING_SECRET_PRESENT="yes"
+    fi
+    if grep -qE '^\s*\[(qpu|dwave)\]\s*$' "${config}"; then
+      EXISTING_VARIANT="qpu"
+    elif grep -qE '^\s*\[(gpu|cuda)(\.|])' "${config}"; then
+      EXISTING_VARIANT="cuda"
+    elif grep -qE '^\s*\[cpu\]\s*$' "${config}"; then
+      EXISTING_VARIANT="cpu"
+    fi
+  fi
+
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "quip-qpu"; then
+    EXISTING_VARIANT="qpu"
+  elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "quip-cuda"; then
+    EXISTING_VARIANT="cuda"
+  elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "quip-cpu"; then
+    EXISTING_VARIANT="${EXISTING_VARIANT:-cpu}"
+  fi
+
+  EXISTING_DOMAIN="$(normalise_domain "$(get_env_value "${env_file}" "QUIP_HOSTNAME")")"
+  EXISTING_CERT_EMAIL="$(get_env_value "${env_file}" "CERT_EMAIL")"
+  EXISTING_DWAVE_API_KEY="$(get_env_value "${env_file}" "DWAVE_API_KEY")"
+
+  log "Menemukan deployment existing di ${INSTALL_DIR}."
+  info "Schema config : ${EXISTING_SCHEMA:-tidak terdeteksi}"
+  info "Varian node   : ${EXISTING_VARIANT:-tidak terdeteksi}"
+  info "Nama node     : ${EXISTING_NODE_NAME:-belum ada}"
+  info "Domain        : ${EXISTING_DOMAIN:-belum ada}"
+  info "Public host/IP: ${EXISTING_PUBLIC_HOST:-belum ada}"
+  if [[ "${EXISTING_SECRET_PRESENT}" == "yes" ]]; then
+    info "Secret v0.1   : terdeteksi, akan tetap tersimpan di backup"
+  fi
+}
+
+choose_variant() {
+  local default="${EXISTING_VARIANT:-cpu}"
+
+  if [[ "${EXISTING_INSTALL}" == "yes" && -n "${EXISTING_VARIANT}" ]]; then
+    NODE_VARIANT="${EXISTING_VARIANT}"
+    PROFILE="${NODE_VARIANT}"
+    [[ "${NODE_VARIANT}" == "qpu" ]] && PROFILE="cpu"
+    log "Mempertahankan varian miner existing: ${NODE_VARIANT} (profile ${PROFILE})."
+    return
+  fi
+
+  local default_choice="1"
+  [[ "${default}" == "cuda" ]] && default_choice="2"
+  [[ "${default}" == "qpu" ]] && default_choice="3"
+
+  echo
+  echo "Pilih varian miner:"
+  echo "  1) CPU mining (recommended untuk VPS biasa)"
+  echo "  2) CUDA GPU mining (butuh NVIDIA GPU + driver)"
+  echo "  3) QPU D-Wave (berjalan di profile CPU, butuh DWAVE_API_KEY)"
+  local choice
+  choice="$(read_prompt "Pilihan [${default_choice}]: ")"
+  case "${choice:-$default_choice}" in
+    1) NODE_VARIANT="cpu"; PROFILE="cpu" ;;
+    2) NODE_VARIANT="cuda"; PROFILE="cuda" ;;
+    3) NODE_VARIANT="qpu"; PROFILE="cpu" ;;
+    *) warn "Pilihan tidak dikenal, pakai CPU."; NODE_VARIANT="cpu"; PROFILE="cpu" ;;
+  esac
+}
+
+collect_inputs() {
+  choose_variant
+
+  NODE_NAME="$(prompt_default "Nama node untuk dashboard" "${EXISTING_NODE_NAME:-${HOSTNAME}}")"
+
+  local tls_default="N"
+  if is_public_domain "${EXISTING_DOMAIN}"; then
+    tls_default="Y"
+  fi
+
+  ENABLE_TLS="no"
+  if confirm "Gunakan domain + HTTPS otomatis untuk dashboard?" "${tls_default}"; then
+    ENABLE_TLS="yes"
+    if is_public_domain "${EXISTING_DOMAIN}"; then
+      DASHBOARD_DOMAIN="$(prompt_default "Domain dashboard tanpa http/https" "${EXISTING_DOMAIN}")"
+    else
+      DASHBOARD_DOMAIN="$(prompt_optional "Domain dashboard tanpa http/https, contoh node.example.com")"
+    fi
+    DASHBOARD_DOMAIN="$(normalise_domain "${DASHBOARD_DOMAIN}")"
+    while ! is_public_domain "${DASHBOARD_DOMAIN}"; do
+      warn "Isi domain publik yang valid, contoh node.example.com."
+      DASHBOARD_DOMAIN="$(normalise_domain "$(prompt_optional "Domain dashboard tanpa http/https")")"
+    done
+
+    if [[ -n "${EXISTING_CERT_EMAIL}" ]]; then
+      CERT_EMAIL="$(prompt_default "Email Let's Encrypt" "${EXISTING_CERT_EMAIL}")"
+    else
+      CERT_EMAIL="$(prompt_optional "Email Let's Encrypt")"
+    fi
+    while [[ -z "${CERT_EMAIL}" || "${CERT_EMAIL}" != *@* ]]; do
+      warn "Email Let's Encrypt wajib diisi untuk HTTPS otomatis."
+      CERT_EMAIL="$(prompt_optional "Email Let's Encrypt")"
+    done
+  else
+    DASHBOARD_DOMAIN=""
+    CERT_EMAIL=""
+  fi
+
+  DWAVE_API_KEY="${EXISTING_DWAVE_API_KEY}"
+  if [[ "${NODE_VARIANT}" == "qpu" ]] &&
+     [[ -z "${DWAVE_API_KEY}" || "${DWAVE_API_KEY}" == "your-dwave-api-token-here" ]]; then
+    DWAVE_API_KEY="$(prompt_optional "DWAVE_API_KEY")"
+    while [[ -z "${DWAVE_API_KEY}" ]]; do
+      warn "DWAVE_API_KEY wajib diisi untuk QPU."
+      DWAVE_API_KEY="$(prompt_optional "DWAVE_API_KEY")"
+    done
+  fi
+
+  ENABLE_TUNE="no"
+  confirm "Jalankan kernel tuning BBR/fq dari Quip?" "Y" && ENABLE_TUNE="yes"
+
+  ENABLE_UFW="no"
+  confirm "Update firewall ufw otomatis untuk port Quip v0.2?" "Y" && ENABLE_UFW="yes"
+
+  ENABLE_CRON="no"
+  confirm "Install atau refresh cron auto-update per jam?" "Y" && ENABLE_CRON="yes"
+
+  ENABLE_SCREEN="no"
+  confirm "Buat atau refresh helper screen untuk monitor logs?" "Y" && ENABLE_SCREEN="yes"
+}
+
+stop_legacy_containers() {
+  if [[ "${EXISTING_INSTALL}" != "yes" ]]; then
+    return
+  fi
+
+  log "Menghentikan container Quip lama sebelum upgrade..."
+  docker stop quip-cpu quip-cuda quip-qpu quip-dashboard quip-postgres quip-caddy 2>/dev/null || true
+  docker rm quip-cpu quip-cuda quip-qpu quip-dashboard quip-postgres quip-caddy 2>/dev/null || true
+}
+
+clone_or_update_repo() {
+  log "Menyiapkan deployment repo ${DEPLOY_BRANCH} di ${INSTALL_DIR}..."
+  mkdir -p "$(dirname "${INSTALL_DIR}")"
+
+  if [[ -d "${INSTALL_DIR}/.git" ]]; then
+    git -C "${INSTALL_DIR}" fetch --prune origin
+    if git -C "${INSTALL_DIR}" show-ref --verify --quiet "refs/heads/${DEPLOY_BRANCH}"; then
+      git -C "${INSTALL_DIR}" switch "${DEPLOY_BRANCH}"
+    else
+      git -C "${INSTALL_DIR}" switch --track -c "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}"
+    fi
+    git -C "${INSTALL_DIR}" pull --ff-only origin "${DEPLOY_BRANCH}"
+  elif [[ -e "${INSTALL_DIR}" ]]; then
+    err "${INSTALL_DIR} sudah ada tapi bukan git repo. Pilih folder lain atau pindahkan folder tersebut."
+    exit 1
+  else
+    git clone --branch "${DEPLOY_BRANCH}" --single-branch "${DEPLOY_REPO}" "${INSTALL_DIR}"
+  fi
+
+  if [[ -e "${INSTALL_DIR}/docker-compose.override.yml" ]]; then
+    local backup="${INSTALL_DIR}/docker-compose.override.yml.v0.1_backup.$(date +%Y%m%d%H%M%S)"
+    warn "Memindahkan override lama agar node tidak masuk dev chain tanpa sengaja."
+    mv "${INSTALL_DIR}/docker-compose.override.yml" "${backup}"
+    info "Backup override: ${backup}"
+  fi
+}
+
+run_config_converter() {
+  if python3 -c 'import tomllib' >/dev/null 2>&1; then
+    python3 scripts/upgrade-config.py data
+  else
+    warn "Python host belum punya tomllib. Menjalankan converter resmi lewat python:3.12-alpine."
+    docker run --rm \
+      -v "${INSTALL_DIR}:/work" \
+      -w /work \
+      python:3.12-alpine \
+      python3 scripts/upgrade-config.py data
+  fi
+}
+
+append_qpu_config() {
+  cat >> data/config.toml <<'EOF'
+
+[qpu]
+
+[dwave]
+solver = "Advantage2_system1.13"
+dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+daily_budget = "16m"
+EOF
+}
+
+set_config_node_name() {
+  python3 - "${NODE_NAME}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+node_name = sys.argv[1].replace("\\", "\\\\").replace('"', '\\"')
 path = Path("data/config.toml")
 text = path.read_text()
-
-def render(value, quote=True):
-    return f'"{value}"' if quote else str(value)
-
-def strip_accidental_top_level(src):
-    first_section = re.search(r'(?m)^\s*\[', src)
-    if not first_section:
-        return src
-    head, tail = src[:first_section.start()], src[first_section.start():]
-    for key in ("secret", "node_name", "public_host", "public_port"):
-        head = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=.*\n?', '', head)
-    return head.rstrip() + "\n\n" + tail.lstrip()
-
-def section_bounds(src, section):
-    header = re.search(rf'(?m)^\s*\[{re.escape(section)}\]\s*$', src)
-    if not header:
-        raise SystemExit(f"Missing [{section}] section in data/config.toml")
-    next_header = re.search(r'(?m)^\s*\[', src[header.end():])
-    end = header.end() + next_header.start() if next_header else len(src)
-    return header.start(), end
-
-def set_section_value(src, section, key, value, quote=True):
-    start, end = section_bounds(src, section)
-    block = src[start:end]
-    tail = src[end:]
-    pattern = rf'(?m)^(\s*#?\s*{re.escape(key)}\s*=\s*).*$'
-    replacement = lambda m: re.sub(r'#\s*', '', m.group(1), count=1) + render(value, quote)
-    if re.search(pattern, block):
-        block = re.sub(pattern, replacement, block, count=1)
-    else:
-        block = block.rstrip() + f'\n{key} = {render(value, quote)}\n'
-    return src[:start] + block + tail
-
-def set_existing_section_value(src, section, key, value, quote=True):
-    try:
-        start, end = section_bounds(src, section)
-    except SystemExit:
-        return src
-    block = src[start:end]
-    pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*).*$'
-    if re.search(pattern, block):
-        block = re.sub(pattern, lambda m: f'{m.group(1)}{render(value, quote)}', block, count=1)
-    return src[:start] + block + src[end:]
-
-text = strip_accidental_top_level(text)
-text = set_section_value(text, "global", "secret", secret)
-text = set_section_value(text, "global", "node_name", node_name)
-text = set_section_value(text, "global", "public_host", public_host)
-text = set_section_value(text, "global", "public_port", p2p_port, quote=False)
-text = set_existing_section_value(text, "cpu", "public_host", public_host)
-text = set_existing_section_value(text, "cpu", "public_port", p2p_port, quote=False)
-text = set_existing_section_value(text, "cuda", "public_host", public_host)
-text = set_existing_section_value(text, "cuda", "public_port", p2p_port, quote=False)
-text = set_existing_section_value(text, "qpu", "public_host", public_host)
-text = set_existing_section_value(text, "qpu", "public_port", p2p_port, quote=False)
-
-path.write_text(text)
+section = "miner" if re.search(r"(?m)^\s*\[miner\]\s*$", text) else "global"
+header = re.search(rf"(?m)^\s*\[{section}\]\s*$", text)
+if not header:
+    raise SystemExit(f"Missing [{section}] section in data/config.toml")
+next_header = re.search(r"(?m)^\s*\[", text[header.end():])
+end = header.end() + next_header.start() if next_header else len(text)
+block = text[header.start():end]
+line = f'node_name = "{node_name}"'
+if re.search(r"(?m)^\s*node_name\s*=", block):
+    block = re.sub(r"(?m)^\s*node_name\s*=.*$", line, block, count=1)
+else:
+    block = block.rstrip() + "\n" + line + "\n"
+path.write_text(text[:header.start()] + block + text[end:])
 PY
-
-  cp env.example .env
-  {
-    echo "PUID=$(id -u "${RUN_USER}")"
-    echo "PGID=$(id -g "${RUN_USER}")"
-  } >> .env
-
-  if [[ "${PROFILE}" == "${NODE_MODE}" ]]; then
-    set_env "QUIP_HOSTNAME" "${QUIP_HOSTNAME}"
-    [[ -n "${CERT_EMAIL}" ]] && set_env "CERT_EMAIL" "${CERT_EMAIL}"
-  else
-    set_env "QUIP_HOSTNAME" "localhost:20080"
-  fi
-
-  if [[ "${NODE_MODE}" == "qpu" && -n "${DWAVE_API_KEY}" ]]; then
-    set_env "DWAVE_API_KEY" "${DWAVE_API_KEY}"
-  fi
-
-  if [[ -n "${POSTGRES_PASSWORD}" ]]; then
-    set_env "POSTGRES_PASSWORD" "${POSTGRES_PASSWORD}"
-  fi
-
-  chown -R "${RUN_USER}:${RUN_USER}" "${INSTALL_DIR}"
 }
 
 set_env() {
@@ -306,6 +429,60 @@ set_env() {
   else
     echo "${key}=${value}" >> .env
   fi
+}
+
+unset_env() {
+  local key="$1"
+  sed -i "/^[[:space:]]*#\\?[[:space:]]*${key}=/d" .env
+}
+
+configure_node() {
+  log "Menyiapkan konfigurasi Quip v0.2..."
+  cd "${INSTALL_DIR}"
+
+  if [[ "${EXISTING_INSTALL}" == "yes" && "${EXISTING_SCHEMA}" == "v0.1" ]]; then
+    log "Mengonversi data/config.toml v0.1 ke v0.2. Data lama akan dibackup otomatis."
+    run_config_converter
+  elif [[ ! -f data/config.toml ]]; then
+    if [[ "${NODE_VARIANT}" == "cuda" ]]; then
+      cp data/config.cuda.toml data/config.toml
+    else
+      cp data/config.cpu.toml data/config.toml
+    fi
+    if [[ "${NODE_VARIANT}" == "qpu" ]]; then
+      append_qpu_config
+    fi
+  fi
+
+  set_config_node_name
+
+  if [[ ! -f .env ]]; then
+    cp env.example .env
+  fi
+
+  unset_env "QUIP_NODE_URL"
+  unset_env "QUIP_NODE_TOKEN"
+  unset_env "DASHBOARD_PORT"
+  set_env "PUID" "$(id -u "${RUN_USER}")"
+  set_env "PGID" "$(id -g "${RUN_USER}")"
+  set_env "VALIDATOR_NAME" "${NODE_NAME}"
+  set_env "QUIP_MINER_TAG" "v0.2"
+  set_env "QUIP_DASHBOARD_TAG" "v0.2"
+  set_env "QUIP_VALIDATOR_TAG" "v0.2"
+
+  if [[ "${ENABLE_TLS}" == "yes" ]]; then
+    set_env "QUIP_HOSTNAME" "${DASHBOARD_DOMAIN},${DASHBOARD_DOMAIN}:${API_PORT}"
+    set_env "CERT_EMAIL" "${CERT_EMAIL}"
+  else
+    set_env "QUIP_HOSTNAME" ":${API_PORT}"
+    set_env "CERT_EMAIL" ""
+  fi
+
+  if [[ "${NODE_VARIANT}" == "qpu" ]]; then
+    set_env "DWAVE_API_KEY" "${DWAVE_API_KEY}"
+  fi
+
+  chown -R "${RUN_USER}:${RUN_USER}" "${INSTALL_DIR}"
 }
 
 tune_kernel() {
@@ -321,24 +498,25 @@ configure_firewall() {
     return
   fi
 
-  log "Membuka port firewall dengan ufw..."
+  log "Memperbarui firewall ufw untuk Quip v0.2..."
   ufw allow OpenSSH || true
-  ufw allow "${P2P_PORT}/tcp"
-  ufw allow "${P2P_PORT}/udp"
+  ufw --force delete allow "${API_PORT}/udp" >/dev/null 2>&1 || true
+  ufw allow "${API_PORT}/tcp"
+  ufw allow "${VALIDATOR_P2P_PORT}/tcp"
+  ufw allow "${VALIDATOR_P2P_PORT}/udp"
 
-  if [[ "${PROFILE}" == "${NODE_MODE}" ]]; then
+  if [[ "${ENABLE_TLS}" == "yes" ]]; then
     ufw allow 80/tcp
     ufw allow 443/tcp
-  elif [[ "${PROFILE}" == "${NODE_MODE}-notls" ]]; then
-    ufw allow 20080/tcp
   fi
 
   ufw --force enable
 }
 
 start_node() {
-  log "Menjalankan Quip profile: ${PROFILE}"
+  log "Memvalidasi dan menjalankan Quip profile: ${PROFILE}"
   cd "${INSTALL_DIR}"
+  docker compose --profile "${PROFILE}" config >/dev/null
   docker compose --profile "${PROFILE}" up -d
 }
 
@@ -350,33 +528,14 @@ install_cron_update() {
   fi
 }
 
-setup_pm2_watchdog() {
-  if [[ "${ENABLE_PM2}" != "yes" ]]; then
+remove_legacy_pm2_watchdog() {
+  if ! command -v pm2 >/dev/null 2>&1; then
     return
   fi
-
-  log "Mendaftarkan PM2 watchdog helper..."
-  local script_path="${INSTALL_DIR}/pm2-quip-watchdog.sh"
-  cat > "${script_path}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-cd "${INSTALL_DIR}"
-while true; do
-  docker compose --profile "${PROFILE}" up -d
-  sleep 300
-done
-EOF
-  chmod +x "${script_path}"
-  chown "${RUN_USER}:${RUN_USER}" "${script_path}"
-
-  if [[ "${RUN_USER}" == "root" ]]; then
-    pm2 start "${script_path}" --name quip-watchdog
-    pm2 save
-    pm2 startup systemd -u root --hp /root || true
-  else
-    sudo -u "${RUN_USER}" pm2 start "${script_path}" --name quip-watchdog
-    sudo -u "${RUN_USER}" pm2 save
-    pm2 startup systemd -u "${RUN_USER}" --hp "${RUN_HOME}" || true
+  if pm2 describe quip-watchdog >/dev/null 2>&1; then
+    warn "Menghapus PM2 watchdog lama. Docker restart policy v0.2 sudah cukup."
+    pm2 delete quip-watchdog || true
+    pm2 save || true
   fi
 }
 
@@ -412,90 +571,39 @@ EOF
 
 print_summary() {
   echo
-  log "Install selesai."
+  log "Install atau upgrade selesai."
   echo "Folder install      : ${INSTALL_DIR}"
-  echo "Mode/profile        : ${PROFILE}"
-  echo "P2P port            : ${P2P_PORT}/tcp + ${P2P_PORT}/udp"
+  echo "Upstream branch     : ${DEPLOY_BRANCH}"
+  echo "Miner variant       : ${NODE_VARIANT}"
+  echo "Compose profile     : ${PROFILE}"
+  echo "Public API          : ${API_PORT}/tcp"
+  echo "Validator libp2p    : ${VALIDATOR_P2P_PORT}/tcp + ${VALIDATOR_P2P_PORT}/udp"
   echo "Config              : ${INSTALL_DIR}/data/config.toml"
   echo "Env                 : ${INSTALL_DIR}/.env"
 
-  if [[ "${PROFILE}" == "${NODE_MODE}" ]]; then
-    echo "Dashboard           : https://${QUIP_HOSTNAME}/"
-  elif [[ "${PROFILE}" == "${NODE_MODE}-notls" ]]; then
-    echo "Dashboard           : http://SERVER_IP:20080/"
+  if [[ "${EXISTING_SCHEMA}" == "v0.1" ]]; then
+    echo "Backup config lama  : ${INSTALL_DIR}/data/.v0.1_backup/"
+    echo "Backup env lama     : ${INSTALL_DIR}/.env.v0.1_backup"
+  fi
+
+  if [[ "${ENABLE_TLS}" == "yes" ]]; then
+    echo "Dashboard           : https://${DASHBOARD_DOMAIN}/"
   else
-    echo "Dashboard           : disabled"
+    echo "Dashboard           : http://SERVER_IP:${API_PORT}/"
   fi
 
   echo
   echo "Command penting:"
   echo "  cd ${INSTALL_DIR}"
-  echo "  docker compose ps"
-  echo "  docker compose logs --tail=200 ${NODE_MODE}"
-  echo "  docker compose logs --tail=200 -f ${NODE_MODE}  # realtime, keluar Ctrl+C"
-  echo "  docker compose restart ${NODE_MODE}"
+  echo "  docker compose --profile ${PROFILE} ps"
+  echo "  docker compose logs --tail=200 -f ${PROFILE}"
+  echo "  docker compose logs --tail=200 -f quip-validator"
+  echo "  docker compose logs --tail=200 -f quip-bootstrap"
   echo "  bash ./cron.sh"
   if [[ "${ENABLE_SCREEN}" == "yes" ]]; then
-    echo "  quip-logs          # buka logs di screen baru"
-    echo "  quip-logs-attach   # attach ulang ke screen logs"
+    echo "  quip-logs          # buka logs di screen"
+    echo "  quip-logs-attach   # attach ulang"
   fi
-}
-
-collect_inputs() {
-  INSTALL_DIR="$(prompt_default "Folder install" "${INSTALL_DIR_DEFAULT}")"
-  choose_mode
-  choose_profile
-
-  NODE_USERNAME="$(prompt_default "Username node" "${HOSTNAME}")"
-  NODE_WALLET="$(prompt_optional "Wallet address, contoh 0x1234...")"
-  while [[ -z "${NODE_WALLET}" ]]; do
-    warn "Wallet address tidak boleh kosong untuk format node name."
-    NODE_WALLET="$(prompt_optional "Wallet address")"
-  done
-  NODE_NAME="${NODE_USERNAME} - ${NODE_WALLET}"
-  log "Node name akan diset: ${NODE_NAME}"
-  P2P_PORT="$(prompt_default "Port P2P public" "${DEFAULT_P2P_PORT}")"
-
-  if [[ "${PROFILE}" == "${NODE_MODE}" ]]; then
-    QUIP_HOSTNAME="$(prompt_optional "Domain untuk dashboard/TLS, contoh node.example.com")"
-    while [[ -z "${QUIP_HOSTNAME}" || "${QUIP_HOSTNAME}" == *":"* ]]; do
-      warn "Untuk TLS otomatis, isi domain asli tanpa port."
-      QUIP_HOSTNAME="$(prompt_optional "Domain untuk dashboard/TLS")"
-    done
-    PUBLIC_HOST="${QUIP_HOSTNAME}"
-    CERT_EMAIL="$(prompt_optional "Email Let's Encrypt")"
-  else
-    PUBLIC_HOST="$(prompt_optional "Public host untuk node, idealnya domain. Boleh IP jika belum punya domain")"
-    while [[ -z "${PUBLIC_HOST}" ]]; do
-      PUBLIC_HOST="$(prompt_optional "Public host tidak boleh kosong")"
-    done
-    QUIP_HOSTNAME="localhost:20080"
-    CERT_EMAIL=""
-  fi
-
-  NODE_SECRET="$(prompt_optional "Node secret, kosongkan untuk generate otomatis")"
-
-  DWAVE_API_KEY=""
-  if [[ "${NODE_MODE}" == "qpu" ]]; then
-    DWAVE_API_KEY="$(prompt_optional "DWAVE_API_KEY")"
-  fi
-
-  POSTGRES_PASSWORD="$(prompt_optional "POSTGRES_PASSWORD, kosongkan untuk default repo")"
-
-  ENABLE_TUNE="no"
-  confirm "Jalankan kernel tuning BBR/fq dari Quip?" "Y" && ENABLE_TUNE="yes"
-
-  ENABLE_UFW="no"
-  confirm "Auto buka port dengan ufw?" "Y" && ENABLE_UFW="yes"
-
-  ENABLE_CRON="no"
-  confirm "Install cron auto-update per jam?" "Y" && ENABLE_CRON="yes"
-
-  ENABLE_PM2="no"
-  confirm "Aktifkan PM2 watchdog helper? Docker detached tetap jalan 24/7 tanpa ini" "N" && ENABLE_PM2="yes"
-
-  ENABLE_SCREEN="no"
-  confirm "Buat helper screen untuk monitor logs?" "Y" && ENABLE_SCREEN="yes"
 }
 
 main() {
@@ -503,19 +611,23 @@ main() {
   require_root
   require_interactive_stdin
   detect_user
-  collect_inputs
+  INSTALL_DIR="$(prompt_default "Folder install" "${INSTALL_DIR_DEFAULT}")"
   install_packages
   install_docker
-  install_pm2_if_needed
+  detect_existing_install
+  collect_inputs
+  stop_legacy_containers
   clone_or_update_repo
   configure_node
   tune_kernel
   configure_firewall
+  remove_legacy_pm2_watchdog
   start_node
   install_cron_update
-  setup_pm2_watchdog
   create_screen_helpers
   print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

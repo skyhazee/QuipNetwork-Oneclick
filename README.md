@@ -1,36 +1,83 @@
 # Quip Network One-Click Installer
 
-One-click installer interaktif untuk menjalankan Quip Network node di VPS Linux memakai Docker Compose deployment resmi Quip.
+Installer interaktif untuk menjalankan atau meng-upgrade Quip Network node di VPS Debian/Ubuntu memakai Docker Compose deployment resmi Quip.
 
-Repo resmi Quip yang dipakai installer:
+Repo resmi yang dipakai installer:
 
 https://gitlab.com/quip.network/nodes.quip.network
 
-## 1. Buat Akun, Quest, Dan Wallet
+Installer saat ini mengikuti branch upstream `v0.2`. Versi ini mengganti node mesh lama dengan miner dan validator Substrate lokal.
 
-Sebelum install node, kerjakan ini dulu.
+## Perubahan Penting v0.2
 
-### Quest / Airdrop
+- `quip-node` lama berubah menjadi `quip-miner`.
+- Setiap node menjalankan validator lokal.
+- Miner baru otomatis membuat keystore, register ke chain, dan meminta dana testnet dari faucet.
+- Port API/dashboard tetap memakai `20049/tcp`.
+- Port validator baru memakai `30333/tcp` dan `30333/udp`.
+- Secret node v0.1 tidak dipakai lagi. Signer baru disimpan sebagai keystore.
+- QPU tetap didukung, tetapi berjalan di profile Compose `cpu` dengan konfigurasi D-Wave tambahan.
 
-Buka:
+## Upgrade Dari Installer Lama
+
+Kalau sebelumnya sudah install memakai repo ini, cukup download installer terbaru dan jalankan ulang:
+
+```bash
+curl -fsSL -o quip-install.sh https://raw.githubusercontent.com/skyhazee/QuipNetwork-Oneclick/main/install.sh
+sudo bash quip-install.sh
+```
+
+Pakai folder install lama saat ditanya. Default:
+
+```text
+/opt/quip-node
+```
+
+Installer akan otomatis:
+
+- Mendeteksi config v0.1 dan mode lama: CPU, CUDA, atau QPU.
+- Memakai nama node, domain, email TLS, dan `DWAVE_API_KEY` lama sebagai default jika tersedia.
+- Mempertahankan `public_host` atau IP lama di config hasil migrasi jika sebelumnya ada.
+- Menghentikan dan menghapus container v0.1 sebelum migrasi.
+- Memindahkan deployment resmi ke branch upstream `v0.2`.
+- Menjalankan converter resmi untuk `data/config.toml` dan `.env`.
+- Menyimpan backup data lama.
+- Mengubah format domain Caddy untuk HTTPS v0.2.
+- Membuka port firewall baru dan menghapus rule UDP `20049` lama.
+- Menjalankan miner, validator, dashboard, Postgres, Caddy, dan bootstrap otomatis.
+
+Backup hasil migrasi:
+
+```text
+/opt/quip-node/data/.v0.1_backup/
+/opt/quip-node/.env.v0.1_backup
+```
+
+Secret lama tetap tersimpan di backup config. v0.2 tidak menggunakannya lagi karena signer memakai:
+
+```text
+/opt/quip-node/data/keystore.json
+```
+
+Jangan hapus folder backup sebelum node v0.2 berjalan normal.
+
+## Fresh Install
+
+### 1. Buat Akun, Quest, Dan Wallet
+
+Quest / airdrop:
 
 https://quest.quip.network/airdrop?referral_code=SKYHAZE
 
-Buat akun atau login, lalu selesaikan quest untuk mengumpulkan poin.
-
-### Wallet / Account Quip
-
-Buka:
+Account Quip:
 
 https://account.quip.network/?ref=0x52decdff72fa150be1d36b7e63aa32daaf1b0356
 
-Buat wallet atau connect wallet kamu.
+Gunakan wallet yang sama untuk akun quest dan account Quip.
 
-Penting: akun quest dan account Quip harus pakai **wallet yang sama**.
+### 2. Siapkan Domain
 
-## 2. Siapkan Domain
-
-Disarankan pakai subdomain khusus, contoh:
+Domain disarankan agar dashboard memakai HTTPS. Buat subdomain khusus, contoh:
 
 ```text
 quip.example.com
@@ -47,173 +94,146 @@ TTL   : Auto
 
 Tunggu sampai DNS resolve ke IP VPS.
 
-## 3. Install Node
-
-Login ke VPS sebagai root atau user sudo, lalu jalankan:
+### 3. Jalankan Installer
 
 ```bash
 curl -fsSL -o quip-install.sh https://raw.githubusercontent.com/skyhazee/QuipNetwork-Oneclick/main/install.sh
 sudo bash quip-install.sh
 ```
 
-Ikuti menu interaktifnya.
-
-Rekomendasi jawaban untuk VPS biasa:
+Rekomendasi jawaban untuk VPS CPU biasa:
 
 ```text
-Mode node: CPU
-Profile: Full node + dashboard + Caddy/TLS
-Username node: username kamu
-Wallet address: wallet kamu
-Port P2P: 20049
-Domain: quip.example.com
+Folder install: /opt/quip-node
+Varian miner: CPU
+Nama node untuk dashboard: username-kamu
+Gunakan domain + HTTPS otomatis: Y
+Domain dashboard: quip.example.com
 Email Let's Encrypt: email aktif kamu
-Node secret: kosongkan saja
-POSTGRES_PASSWORD: kosongkan saja
 Kernel tuning: Y
-Buka port otomatis dengan ufw: Y
+Update firewall ufw otomatis: Y
 Cron auto-update: Y
-PM2 watchdog: N
 Screen logs helper: Y
 ```
 
-## Format Nama Node
+Wallet dan secret tidak perlu dimasukkan ke installer v0.2. Keystore signer dibuat otomatis saat bootstrap pertama.
 
-Nama node harus memakai format:
+## Mode Miner
 
-```text
-username - wallet
-```
-
-Perhatikan spasinya:
+Pilihan yang tersedia:
 
 ```text
-username[spasi]-[spasi]0xWalletAddress
+1) CPU mining
+2) CUDA GPU mining
+3) QPU D-Wave
 ```
 
-Contoh:
+CUDA membutuhkan NVIDIA GPU dan driver yang sesuai.
+
+QPU membutuhkan:
 
 ```text
-myusername - 0x1234567890abcdef1234567890abcdef12345678
+DWAVE_API_KEY
 ```
 
-Installer akan menanyakan `Username node` dan `Wallet address`, lalu otomatis membuat `node_name` dengan format tersebut.
-
-Kalau node sudah terlanjur terinstall, edit manual:
-
-```bash
-cd /opt/quip-node
-nano data/config.toml
-```
-
-Cari:
-
-```toml
-node_name = "nama-lama"
-```
-
-Ubah menjadi:
-
-```toml
-node_name = "username - 0xWalletAddress"
-```
-
-Restart:
-
-```bash
-cd /opt/quip-node
-docker compose restart cpu
-```
-
-## Port
-
-Installer bisa membuka port otomatis dengan `ufw`. Saat ditanya:
-
-```text
-Auto buka port dengan ufw? [Y/n]
-```
-
-Jawab `Y` atau langsung tekan Enter.
-
-Port yang dibuka:
-
-```text
-20049/tcp
-20049/udp
-80/tcp
-443/tcp
-```
-
-Kalau VPS provider kamu punya firewall/security group tambahan, buka port yang sama di panel provider.
-
-## Credential Yang Dibutuhkan
-
-Untuk mode CPU biasa:
-
-- Domain: perlu untuk dashboard HTTPS.
-- Email Let's Encrypt: perlu untuk SSL otomatis.
-- Node secret: boleh dikosongkan, installer akan generate otomatis.
-- POSTGRES_PASSWORD: boleh dikosongkan.
-
-Tidak perlu:
-
-- Private key wallet.
-- DWAVE_API_KEY, kecuali kamu pilih mode QPU/D-Wave.
-
-Backup file ini setelah install:
-
-```text
-/opt/quip-node/data/config.toml
-/opt/quip-node/.env
-```
+QPU memakai profile Compose `cpu`, lalu miner membaca section `[qpu]` dan `[dwave]` dari config.
 
 ## Dashboard
 
-Kalau pakai domain:
+Dengan domain dan HTTPS:
 
 ```text
-https://quip.example.com
+https://quip.example.com/
 ```
 
-Kalau pilih no TLS:
+Tanpa domain:
 
 ```text
-http://IP_VPS:20080
+http://IP_VPS:20049/
 ```
+
+Untuk HTTPS, installer menyimpan format Caddy v0.2 berikut di `.env`:
+
+```text
+QUIP_HOSTNAME=quip.example.com,quip.example.com:20049
+```
+
+## Firewall
+
+Installer dapat memperbarui `ufw` otomatis. Port Quip v0.2:
+
+```text
+20049/tcp       Caddy, dashboard, API, dan RPC publik
+30333/tcp       Validator libp2p
+30333/udp       Validator libp2p
+80/tcp          Let's Encrypt HTTP-01
+443/tcp         Dashboard HTTPS
+```
+
+Rule lama berikut akan dihapus karena tidak dipakai v0.2:
+
+```text
+20049/udp
+```
+
+Kalau provider VPS punya firewall atau security group tambahan, buka port yang sama dari panel provider.
+
+Cek port publik dari VPS:
+
+```bash
+curl -sS https://check.quip.network/checkport?port=20049
+curl -sS https://check.quip.network/checkport?port=30333
+curl -sS https://check.quip.network/checkport?port=80
+curl -sS https://check.quip.network/checkport?port=443
+```
+
+Port `80` dan `443` hanya diperlukan jika memakai domain + HTTPS.
 
 ## Cek Node
 
-Semua command Docker Compose harus dijalankan dari folder install:
+Masuk ke folder deployment:
 
 ```bash
 cd /opt/quip-node
 ```
 
-Cek container:
+Cek semua container:
 
 ```bash
-docker compose ps
+docker compose --profile cpu ps
 ```
 
-Lihat logs:
+Untuk CUDA, ganti profile menjadi:
 
 ```bash
-docker compose logs --tail=200 -f
+docker compose --profile cuda ps
 ```
 
-Command logs dengan `-f` adalah realtime/follow mode. Kalau tidak ada log baru, layar bisa diam. Keluar dengan:
+Lihat log miner CPU:
+
+```bash
+docker compose logs --tail=200 -f cpu
+```
+
+Lihat log validator:
+
+```bash
+docker compose logs --tail=200 -f quip-validator
+```
+
+Lihat log bootstrap:
+
+```bash
+docker compose logs --tail=200 -f quip-bootstrap
+```
+
+Keluar dari follow mode dengan:
 
 ```text
 Ctrl+C
 ```
 
-Kalau hanya mau lihat log terakhir tanpa follow:
-
-```bash
-docker compose logs --tail=200
-```
-
-Kalau kamu aktifkan screen helper:
+Kalau mengaktifkan screen helper:
 
 ```bash
 quip-logs
@@ -233,56 +253,99 @@ quip-logs-attach
 
 ## Auto Update
 
-Kalau kamu jawab `Y` di cron auto-update, installer akan pasang update otomatis per jam.
+Kalau cron auto-update diaktifkan, installer memasang pengecekan image per jam.
 
-Cek log update:
+Cek log:
 
 ```bash
 cd /opt/quip-node
 tail -f data/update.log
 ```
 
-Run update manual:
+Jalankan update image manual:
 
 ```bash
 cd /opt/quip-node
 bash ./cron.sh
 ```
 
-## Restart / Stop
+Untuk mengambil perubahan file deployment upstream, jalankan ulang installer one-click.
 
-Restart node CPU:
+## Restart Dan Stop
+
+Restart miner CPU setelah edit config:
 
 ```bash
 cd /opt/quip-node
 docker compose restart cpu
 ```
 
-Stop node:
+Recreate stack setelah edit `.env`:
+
+```bash
+cd /opt/quip-node
+docker compose --profile cpu up -d --force-recreate
+```
+
+Stop stack:
 
 ```bash
 cd /opt/quip-node
 docker compose --profile cpu down
 ```
 
-## Troubleshooting Singkat
+## Troubleshooting
 
 Kalau dashboard HTTPS belum bisa dibuka:
 
-- Pastikan DNS sudah mengarah ke IP VPS.
+- Pastikan DNS domain sudah mengarah ke IP VPS.
 - Pastikan port `80/tcp` dan `443/tcp` terbuka.
-- Cek logs Caddy:
+- Cek log Caddy:
 
 ```bash
 cd /opt/quip-node
-docker compose logs -f caddy
+docker compose logs --tail=200 -f caddy
 ```
 
-Kalau node susah peer:
+Kalau validator tidak mendapat peer:
 
-- Pastikan port `20049/tcp` dan `20049/udp` terbuka.
-- Pastikan `public_host` di `/opt/quip-node/data/config.toml` benar.
+- Pastikan `30333/tcp` dan `30333/udp` terbuka di `ufw`.
+- Pastikan security group provider juga membuka port `30333`.
+- Cek log validator:
+
+```bash
+cd /opt/quip-node
+docker compose logs --tail=200 -f quip-validator
+```
+
+Kalau miner belum berjalan setelah upgrade:
+
+- Tunggu validator sync dan bootstrap selesai.
+- Pastikan VPS dapat mengakses faucet testnet.
+- Cek log bootstrap:
+
+```bash
+cd /opt/quip-node
+docker compose logs --tail=200 quip-bootstrap
+```
+
+## File Penting
+
+Backup file ini setelah install atau upgrade:
+
+```text
+/opt/quip-node/data/config.toml
+/opt/quip-node/data/keystore.json
+/opt/quip-node/.env
+```
+
+Untuk node hasil migrasi, simpan juga:
+
+```text
+/opt/quip-node/data/.v0.1_backup/
+/opt/quip-node/.env.v0.1_backup
+```
 
 ## Disclaimer
 
-Installer ini hanya wrapper untuk mempermudah setup. Runtime node tetap memakai deployment resmi Quip Network.
+Installer ini adalah wrapper untuk mempermudah setup dan upgrade. Runtime node tetap memakai deployment resmi Quip Network.
