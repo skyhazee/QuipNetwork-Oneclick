@@ -227,6 +227,36 @@ Lihat log bootstrap:
 docker compose logs --tail=200 -f quip-bootstrap
 ```
 
+## Terminal Dashboard
+
+Installer memasang dashboard terminal yang merangkum status container, progres sync validator, jumlah block tersisa, kecepatan sync, estimasi waktu full sync, serta log validator, miner, dan bootstrap.
+
+Untuk deployment yang sudah terinstall sebelum fitur dashboard tersedia, jalankan ulang installer one-click agar helper dipasang.
+
+Jalankan:
+
+```bash
+quip-dashboard
+```
+
+Dashboard refresh otomatis setiap 5 detik. Keluar dengan:
+
+```text
+Ctrl+C
+```
+
+Atur interval refresh atau jumlah baris log jika diperlukan:
+
+```bash
+QUIP_DASHBOARD_REFRESH=10 QUIP_DASHBOARD_LOG_LINES=15 quip-dashboard
+```
+
+Kalau memakai folder install non-default:
+
+```bash
+QUIP_INSTALL_DIR=/path/to/quip-node quip-dashboard
+```
+
 Keluar dari follow mode dengan:
 
 ```text

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 APP_NAME="quip-oneclick"
 DEPLOY_REPO="https://gitlab.com/quip.network/nodes.quip.network.git"
 DEPLOY_BRANCH="v0.2"
+ONECLICK_RAW_BASE="https://raw.githubusercontent.com/skyhazee/QuipNetwork-Oneclick/main"
 INSTALL_DIR_DEFAULT="/opt/quip-node"
 API_PORT="20049"
 VALIDATOR_P2P_PORT="30333"
@@ -539,6 +540,12 @@ remove_legacy_pm2_watchdog() {
   fi
 }
 
+install_dashboard_helper() {
+  log "Menginstall terminal dashboard Quip..."
+  curl -fsSL "${ONECLICK_RAW_BASE}/quip-dashboard.sh" -o /usr/local/bin/quip-dashboard
+  chmod +x /usr/local/bin/quip-dashboard
+}
+
 create_screen_helpers() {
   if [[ "${ENABLE_SCREEN}" != "yes" ]]; then
     return
@@ -599,6 +606,7 @@ print_summary() {
   echo "  docker compose logs --tail=200 -f ${PROFILE}"
   echo "  docker compose logs --tail=200 -f quip-validator"
   echo "  docker compose logs --tail=200 -f quip-bootstrap"
+  echo "  quip-dashboard     # dashboard status + logs, refresh tiap 5 detik"
   echo "  bash ./cron.sh"
   if [[ "${ENABLE_SCREEN}" == "yes" ]]; then
     echo "  quip-logs          # buka logs di screen"
@@ -622,6 +630,7 @@ main() {
   tune_kernel
   configure_firewall
   remove_legacy_pm2_watchdog
+  install_dashboard_helper
   start_node
   install_cron_update
   create_screen_helpers
