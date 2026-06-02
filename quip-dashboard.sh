@@ -62,13 +62,26 @@ latest_validator_sync_line() {
     tail -n 1 || true
 }
 
+latest_validator_idle_line() {
+  docker logs --tail 400 quip-validator 2>&1 |
+    grep -E 'Idle \(' |
+    tail -n 1 || true
+}
+
 render_sync_status() {
-  local now line best target remaining peers rate eta sync_state
+  local now line idle_line best target remaining peers rate eta sync_state
   now="$(date +%s)"
   line="$(latest_validator_sync_line)"
+  idle_line="$(latest_validator_idle_line)"
   best="$(sed -nE 's/.*best: #([0-9]+).*/\1/p' <<<"${line}")"
+  if [[ -z "${best}" ]]; then
+    best="$(sed -nE 's/.*Imported #([0-9]+).*/\1/p' <<<"${line}")"
+  fi
   target="$(sed -nE 's/.*target=#([0-9]+).*/\1/p' <<<"${line}")"
   peers="$(sed -nE 's/.*\(([0-9]+) peers?\).*/\1/p' <<<"${line}")"
+  if [[ -z "${peers}" ]]; then
+    peers="$(sed -nE 's/.*\(([0-9]+) peers?\).*/\1/p' <<<"${idle_line}")"
+  fi
 
   if [[ -n "${best}" && -z "${target}" ]] && grep -qE 'Idle|Imported #[0-9]+' <<<"${line}"; then
     printf "Validator sync      : ${GREEN}synced${NC}\n"
@@ -119,6 +132,31 @@ render_sync_status() {
   PREV_TIME="${now}"
 }
 
+render_miner_activity() {
+  local container="quip-cpu"
+  local line
+
+  if docker inspect quip-cuda >/dev/null 2>&1; then
+    container="quip-cuda"
+  fi
+
+  if ! docker inspect "${container}" >/dev/null 2>&1; then
+    printf "Miner activity      : ${YELLOW}waiting for miner container${NC}\n"
+    return
+  fi
+
+  line="$(docker logs --tail 300 "${container}" 2>&1 |
+    grep -E 'mine_work_item|participation remark submitted|mining continues' |
+    tail -n 1 || true)"
+
+  if [[ -n "${line}" ]]; then
+    printf "Miner activity      : ${GREEN}active${NC}\n"
+    printf "Latest miner event  : %s\n" "${line}"
+  else
+    printf "Miner activity      : ${YELLOW}running, waiting for mining event${NC}\n"
+  fi
+}
+
 render_logs() {
   local title="$1"
   local container="$2"
@@ -148,6 +186,9 @@ render() {
 
   printf "${BOLD}${BLUE}== Validator Sync ==${NC}\n"
   render_sync_status
+
+  printf "\n${BOLD}${BLUE}== Miner Activity ==${NC}\n"
+  render_miner_activity
 
   render_logs "Validator Logs" "quip-validator"
   if docker inspect quip-cuda >/dev/null 2>&1; then
