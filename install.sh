@@ -3,11 +3,18 @@ set -Eeuo pipefail
 
 APP_NAME="quip-oneclick"
 DEPLOY_REPO="https://gitlab.com/quip.network/nodes.quip.network.git"
-DEPLOY_BRANCH="v0.2"
+# Upstream default branch. main carries the current v0.3 testnet line (the
+# Rust coordinator + Substrate validator). Older v0.2 branches are retired.
+DEPLOY_BRANCH="main"
 ONECLICK_RAW_BASE="https://raw.githubusercontent.com/skyhazee/QuipNetwork-Oneclick/main"
 INSTALL_DIR_DEFAULT="/opt/quip-node"
 API_PORT="20049"
 VALIDATOR_P2P_PORT="30333"
+MPS_PIPE_DIR="/tmp/nvidia-mps"
+# Rest port the coordinator's [dashboard].listen must bind so Caddy can proxy
+# /api/v1/* to it. Source of truth: caddy/Caddyfile in nodes.quip.network
+# (reverse_proxy quip-miner:8086). Keep the two in sync.
+DASHBOARD_REST_PORT="8086"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -50,7 +57,6 @@ detect_user() {
   else
     RUN_USER="root"
   fi
-  RUN_HOME="$(getent passwd "${RUN_USER}" | cut -d: -f6)"
 }
 
 read_prompt() {
@@ -130,6 +136,66 @@ install_docker() {
   systemctl enable --now docker
 }
 
+docker_has_nvidia_runtime() {
+  docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"
+}
+
+install_nvidia_container_toolkit() {
+  if command -v nvidia-ctk >/dev/null 2>&1 && docker_has_nvidia_runtime; then
+    log "NVIDIA Container Toolkit sudah terpasang dan runtime docker sudah dikonfigurasi."
+    return
+  fi
+
+  log "Menginstall NVIDIA Container Toolkit untuk GPU mining..."
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+  apt-get update
+  apt-get install -y nvidia-container-toolkit
+  nvidia-ctk runtime configure --runtime=docker
+  systemctl restart docker
+}
+
+start_host_mps() {
+  if [[ "${NODE_VARIANT}" != "cuda" ]]; then
+    return
+  fi
+
+  log "Menyiapkan NVIDIA MPS untuk berbagi GPU (profile cuda)..."
+  if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+    warn "nvidia-cuda-mps-control tidak ditemukan di host (binary ini dari CUDA toolkit / driver)."
+    warn "Miner GPU akan memakai fallback software nonce reduction (tetap jalan, tanpa SM sharing)."
+    return
+  fi
+
+  mkdir -p "${MPS_PIPE_DIR}" 2>/dev/null || true
+  if pgrep -f nvidia-cuda-mps-control >/dev/null 2>&1; then
+    info "MPS control daemon sudah berjalan (pipe dir: ${MPS_PIPE_DIR})."
+  else
+    info "Menjalankan MPS control daemon (pipe dir: ${MPS_PIPE_DIR})..."
+    if CUDA_MPS_PIPE_DIRECTORY="${MPS_PIPE_DIR}" nvidia-cuda-mps-control -d; then
+      info "MPS control daemon berjalan."
+    else
+      warn "Gagal menjalankan MPS daemon (butuh root / bukan WSL2 / driver belum support)."
+      warn "Miner akan memakai fallback software nonce reduction."
+    fi
+  fi
+}
+
+detect_gpu() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    warn "nvidia-smi tidak ditemukan. Driver NVIDIA tidak terdeteksi."
+    return 1
+  fi
+  if ! nvidia-smi >/dev/null 2>&1; then
+    warn "nvidia-smi tidak bisa berkomunikasi dengan GPU."
+    return 1
+  fi
+  return 0
+}
+
 get_env_value() {
   local file="$1"
   local key="$2"
@@ -183,10 +249,10 @@ detect_existing_install() {
   EXISTING_VARIANT=""
   EXISTING_NODE_NAME=""
   EXISTING_PUBLIC_HOST=""
-  EXISTING_SECRET_PRESENT="no"
   EXISTING_DOMAIN=""
   EXISTING_CERT_EMAIL=""
-  EXISTING_DWAVE_API_KEY=""
+  EXISTING_DWAVE_API_TOKEN=""
+  EXISTING_HAS_KEYSTORE="no"
 
   if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
     return
@@ -197,50 +263,61 @@ detect_existing_install() {
   local env_file="${INSTALL_DIR}/.env"
 
   if [[ -f "${config}" ]]; then
-    if grep -qE '^\s*\[miner\]\s*$' "${config}"; then
+    # v0.3 coordinator schema requires the [dashboard] REST section (Caddy
+    # proxies /api/v1/* to [dashboard].listen). The upstream v0.1→v0.2
+    # converter also promotes public_port into [miner], so [miner]+public_port
+    # alone is NOT enough to call a config v0.3.
+    if grep -qE '^\s*\[miner\]\s*$' "${config}" &&
+       grep -qE '^\s*public_port\s*=' "${config}" &&
+       grep -qE '^\s*\[dashboard\]\s*$' "${config}"; then
+      EXISTING_SCHEMA="v0.3"
+    elif grep -qE '^\s*\[miner\]\s*$' "${config}"; then
       EXISTING_SCHEMA="v0.2"
     elif grep -qE '^\s*\[global\]\s*$' "${config}"; then
-      if grep -qE '^\s*validators\s*=' "${config}"; then
-        EXISTING_SCHEMA="v0.2-template"
-      else
-        EXISTING_SCHEMA="v0.1"
-      fi
+      EXISTING_SCHEMA="v0.1"
     fi
 
     EXISTING_NODE_NAME="$(get_config_value "${config}" "node_name")"
     EXISTING_PUBLIC_HOST="$(get_config_value "${config}" "public_host")"
-    if [[ -n "$(get_config_value "${config}" "secret")" ]]; then
-      EXISTING_SECRET_PRESENT="yes"
-    fi
+
     if grep -qE '^\s*\[(qpu|dwave)\]\s*$' "${config}"; then
       EXISTING_VARIANT="qpu"
-    elif grep -qE '^\s*\[(gpu|cuda)(\.|])' "${config}"; then
+    elif grep -qE '^\s*\[cuda(\.[0-9]+)?\]\s*$' "${config}"; then
       EXISTING_VARIANT="cuda"
     elif grep -qE '^\s*\[cpu\]\s*$' "${config}"; then
       EXISTING_VARIANT="cpu"
     fi
   fi
 
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "quip-qpu"; then
-    EXISTING_VARIANT="qpu"
-  elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "quip-cuda"; then
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "quip-cuda"; then
     EXISTING_VARIANT="cuda"
   elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "quip-cpu"; then
     EXISTING_VARIANT="${EXISTING_VARIANT:-cpu}"
   fi
 
+  if [[ -f "${INSTALL_DIR}/data/keystore.json" ]]; then
+    # Only a legacy (v0.1/v0.2) install has an incompatible keystore format.
+    # A v0.3 install's keystore is the H4 hybrid the coordinator already uses,
+    # so it must never be archived on a routine re-run.
+    if [[ "${EXISTING_SCHEMA}" == "v0.1" || "${EXISTING_SCHEMA}" == "v0.2" ]]; then
+      EXISTING_HAS_KEYSTORE="yes"
+    fi
+  fi
+
   EXISTING_DOMAIN="$(normalise_domain "$(get_env_value "${env_file}" "QUIP_HOSTNAME")")"
   EXISTING_CERT_EMAIL="$(get_env_value "${env_file}" "CERT_EMAIL")"
-  EXISTING_DWAVE_API_KEY="$(get_env_value "${env_file}" "DWAVE_API_KEY")"
+  EXISTING_DWAVE_API_TOKEN="$(get_env_value "${env_file}" "DWAVE_API_TOKEN")"
+  [[ -z "${EXISTING_DWAVE_API_TOKEN}" ]] && \
+    EXISTING_DWAVE_API_TOKEN="$(get_env_value "${env_file}" "DWAVE_API_KEY")"
 
   log "Menemukan deployment existing di ${INSTALL_DIR}."
   info "Schema config : ${EXISTING_SCHEMA:-tidak terdeteksi}"
   info "Varian node   : ${EXISTING_VARIANT:-tidak terdeteksi}"
   info "Nama node     : ${EXISTING_NODE_NAME:-belum ada}"
   info "Domain        : ${EXISTING_DOMAIN:-belum ada}"
-  info "Public host/IP: ${EXISTING_PUBLIC_HOST:-belum ada}"
-  if [[ "${EXISTING_SECRET_PRESENT}" == "yes" ]]; then
-    info "Secret v0.1   : terdeteksi, akan tetap tersimpan di backup"
+  info "Public host   : ${EXISTING_PUBLIC_HOST:-belum ada}"
+  if [[ "${EXISTING_HAS_KEYSTORE}" == "yes" ]]; then
+    info "Keystore v0.2 : terdeteksi (akan diarsipkan sebelum upgrade v0.3)"
   fi
 }
 
@@ -263,7 +340,7 @@ choose_variant() {
   echo "Pilih varian miner:"
   echo "  1) CPU mining (recommended untuk VPS biasa)"
   echo "  2) CUDA GPU mining (butuh NVIDIA GPU + driver)"
-  echo "  3) QPU D-Wave (berjalan di profile CPU, butuh DWAVE_API_KEY)"
+  echo "  3) QPU D-Wave (berjalan di profile CPU, butuh DWAVE_API_TOKEN)"
   local choice
   choice="$(read_prompt "Pilihan [${default_choice}]: ")"
   case "${choice:-$default_choice}" in
@@ -272,12 +349,32 @@ choose_variant() {
     3) NODE_VARIANT="qpu"; PROFILE="cpu" ;;
     *) warn "Pilihan tidak dikenal, pakai CPU."; NODE_VARIANT="cpu"; PROFILE="cpu" ;;
   esac
+
+  if [[ "${NODE_VARIANT}" == "cuda" ]]; then
+    if ! detect_gpu; then
+      err "Mode CUDA dipilih tapi NVIDIA GPU/driver tidak terdeteksi lewat nvidia-smi."
+      err "Pasang driver NVIDIA dulu, atau pilih CPU."
+      exit 1
+    fi
+  fi
+}
+
+detect_public_ip() {
+  local ip
+  ip="$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+  if [[ -z "${ip}" ]]; then
+    ip="$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  printf "%s" "${ip}"
 }
 
 collect_inputs() {
   choose_variant
 
   NODE_NAME="$(prompt_default "Nama node untuk dashboard" "${EXISTING_NODE_NAME:-${HOSTNAME}}")"
+  # Node name lands in config.toml and .env; strip characters that would break
+  # the TOML string or the .env line.
+  NODE_NAME="${NODE_NAME//[\"\`\$\\]/_}"
 
   local tls_default="N"
   if is_public_domain "${EXISTING_DOMAIN}"; then
@@ -312,21 +409,44 @@ collect_inputs() {
     CERT_EMAIL=""
   fi
 
-  DWAVE_API_KEY="${EXISTING_DWAVE_API_KEY}"
+  # public_host: what peers reach this node from outside. In v0.3 this is a
+  # required [miner] key (used to advertise the node's reachable endpoint).
+  PUBLIC_HOST_DEFAULT=""
+  if [[ -n "${EXISTING_PUBLIC_HOST}" ]]; then
+    PUBLIC_HOST_DEFAULT="${EXISTING_PUBLIC_HOST}"
+  elif is_public_domain "${DASHBOARD_DOMAIN}"; then
+    PUBLIC_HOST_DEFAULT="${DASHBOARD_DOMAIN}"
+  else
+    PUBLIC_HOST_DEFAULT="$(detect_public_ip)"
+  fi
+  PUBLIC_HOST="$(prompt_default "Host/IP publik untuk node (public_host)" "${PUBLIC_HOST_DEFAULT}")"
+  while [[ -z "${PUBLIC_HOST}" ]]; do
+    warn "public_host wajib diisi (dipakai coordinator untuk advertise endpoint)."
+    PUBLIC_HOST="$(prompt_optional "Host/IP publik untuk node (public_host)")"
+  done
+
+  DWAVE_API_TOKEN="${EXISTING_DWAVE_API_TOKEN}"
   if [[ "${NODE_VARIANT}" == "qpu" ]] &&
-     [[ -z "${DWAVE_API_KEY}" || "${DWAVE_API_KEY}" == "your-dwave-api-token-here" ]]; then
-    DWAVE_API_KEY="$(prompt_optional "DWAVE_API_KEY")"
-    while [[ -z "${DWAVE_API_KEY}" ]]; do
-      warn "DWAVE_API_KEY wajib diisi untuk QPU."
-      DWAVE_API_KEY="$(prompt_optional "DWAVE_API_KEY")"
+     [[ -z "${DWAVE_API_TOKEN}" || "${DWAVE_API_TOKEN}" == "your-dwave-api-token-here" ]]; then
+    DWAVE_API_TOKEN="$(prompt_optional "DWAVE_API_TOKEN")"
+    while [[ -z "${DWAVE_API_TOKEN}" ]]; do
+      warn "DWAVE_API_TOKEN wajib diisi untuk QPU."
+      DWAVE_API_TOKEN="$(prompt_optional "DWAVE_API_TOKEN")"
     done
+  fi
+
+  if [[ "${NODE_VARIANT}" == "cuda" ]]; then
+    ENABLE_MPS="no"
+    confirm "Jalankan daemon NVIDIA MPS di host untuk SM sharing GPU?" "Y" && ENABLE_MPS="yes"
+  else
+    ENABLE_MPS="no"
   fi
 
   ENABLE_TUNE="no"
   confirm "Jalankan kernel tuning BBR/fq dari Quip?" "Y" && ENABLE_TUNE="yes"
 
   ENABLE_UFW="no"
-  confirm "Update firewall ufw otomatis untuk port Quip v0.2?" "Y" && ENABLE_UFW="yes"
+  confirm "Update firewall ufw otomatis untuk port Quip?" "Y" && ENABLE_UFW="yes"
 
   ENABLE_CRON="no"
   confirm "Install atau refresh cron auto-update per jam?" "Y" && ENABLE_CRON="yes"
@@ -336,13 +456,13 @@ collect_inputs() {
 }
 
 stop_legacy_containers() {
-  if [[ "${EXISTING_INSTALL}" != "yes" ]]; then
-    return
-  fi
-
+  # Stop and remove any pre-existing quip containers regardless of whether the
+  # install dir is this repo (protects against port conflicts when an older
+  # stack runs under a different folder). quip-qpu is the legacy v0.1/v0.2 QPU
+  # container and must be torn down too.
   log "Menghentikan container Quip lama sebelum upgrade..."
-  docker stop quip-cpu quip-cuda quip-qpu quip-dashboard quip-postgres quip-caddy 2>/dev/null || true
-  docker rm quip-cpu quip-cuda quip-qpu quip-dashboard quip-postgres quip-caddy 2>/dev/null || true
+  docker stop quip-cpu quip-cuda quip-qpu quip-dashboard quip-postgres quip-caddy quip-validator 2>/dev/null || true
+  docker rm quip-cpu quip-cuda quip-qpu quip-dashboard quip-postgres quip-caddy quip-validator 2>/dev/null || true
 }
 
 clone_or_update_repo() {
@@ -372,61 +492,176 @@ clone_or_update_repo() {
   fi
 }
 
-run_config_converter() {
-  if python3 -c 'import tomllib' >/dev/null 2>&1; then
-    python3 scripts/upgrade-config.py data
-  else
-    warn "Python host belum punya tomllib. Menjalankan converter resmi lewat python:3.12-alpine."
-    docker run --rm \
-      -v "${INSTALL_DIR}:/work" \
-      -w /work \
-      python:3.12-alpine \
-      python3 scripts/upgrade-config.py data
+# Write a fresh v0.3 coordinator config. The upstream repo's data/config.*.toml
+# are stale v0.1/v0.2-era docs; the v0.3 coordinator requires the schema below.
+# public_host / public_port are mandatory. [dashboard] must bind
+# DASHBOARD_REST_PORT so Caddy's /api/v1/* proxy can reach it.
+write_v03_config() {
+  local config="${INSTALL_DIR}/data/config.toml"
+  mkdir -p "${INSTALL_DIR}/data"
+
+  local backend_section
+  case "${NODE_VARIANT}" in
+    cuda) backend_section=$'[cuda.0]\nbinary = "quip-cuda-sa"\n' ;;
+    qpu)  backend_section=$'[cpu]\nbinary = "quip-cpu-sa"\n\n[dwave]\nbinary = "quip-dwave-qa"\ndaily_budget = "30s"\n' ;;
+    *)    backend_section=$'[cpu]\nbinary = "quip-cpu-sa"\n' ;;
+  esac
+
+  cat > "${config}" <<EOF
+[miner]
+validators = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"]
+faucet_url = "https://faucet.testnet.quip.network"
+signer_key = "/data/keystore.json"
+node_name = "${NODE_NAME}"
+public_host = "${PUBLIC_HOST}"
+public_port = ${API_PORT}
+log_level = "info"
+
+${backend_section}
+[dashboard]
+listen = "0.0.0.0:${DASHBOARD_REST_PORT}"
+data_dir = "/data/attempts"
+EOF
+  chmod 644 "${config}"
+}
+
+backup_legacy_v02() {
+  # v0.3 coordinator uses an H4 hybrid (sr25519 + FN-DSA-512) signer at
+  # /data/keystore.json and generates one only when the file is absent. A
+  # v0.2-era keystore (sr25519 + ML-DSA-44) is a different format, so on an
+  # upgrade we archive it rather than let the coordinator fail against it.
+  if [[ "${EXISTING_HAS_KEYSTORE}" == "yes" && ! -f "${INSTALL_DIR}/data/keystore.json.v0.2-backup" ]]; then
+    log "Mengarsipkan keystore v0.2 ke data/keystore.json.v0.2-backup (node akan generate keystore v0.3 baru)."
+    mv "${INSTALL_DIR}/data/keystore.json" "${INSTALL_DIR}/data/keystore.json.v0.2-backup"
+    chmod 600 "${INSTALL_DIR}/data/keystore.json.v0.2-backup"
   fi
 }
 
-append_qpu_config() {
-  cat >> data/config.toml <<'EOF'
+configure_node() {
+  log "Menyiapkan konfigurasi Quip v0.3..."
+  cd "${INSTALL_DIR}"
 
-[qpu]
+  local config_exists_v03="no"
+  if [[ -f data/config.toml ]]; then
+    # Keep an existing config only when it is genuinely v0.3: [miner] with the
+    # public identity keys AND the [dashboard] REST section. A v0.1/v0.2 file
+    # (even one the upstream converter gave a public_port) is backed up and
+    # replaced with the v0.3 coordinator schema.
+    if grep -qE '^\s*\[miner\]\s*$' data/config.toml &&
+       grep -qE '^\s*public_port\s*=' data/config.toml &&
+       grep -qE '^\s*public_host\s*=' data/config.toml &&
+       grep -qE '^\s*\[dashboard\]\s*$' data/config.toml; then
+      config_exists_v03="yes"
+    else
+      log "Config lama (${EXISTING_SCHEMA:-skema lama}) terdeteksi. Membackup dan menulis config v0.3."
+      cp data/config.toml "data/config.toml.pre-v0.3.$(date +%Y%m%d%H%M%S).bak"
+    fi
+  fi
 
-[dwave]
-solver = "Advantage2_system1.13"
-dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
-daily_budget = "16m"
-EOF
-}
-
-set_config_node_name() {
-  python3 - "${NODE_NAME}" <<'PY'
+  # Keep an existing v0.3 config (operator may have tuned it). Otherwise write
+  # a fresh coordinator config from our template.
+  if [[ "${config_exists_v03}" == "yes" ]]; then
+    # Refresh the identity keys the operator was just prompted for, in place,
+    # without touching the rest of their config.
+    python3 - "${NODE_NAME}" "${PUBLIC_HOST}" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-node_name = sys.argv[1].replace("\\", "\\\\").replace('"', '\\"')
+node_name, public_host = sys.argv[1], sys.argv[2]
 path = Path("data/config.toml")
 text = path.read_text()
-section = "miner" if re.search(r"(?m)^\s*\[miner\]\s*$", text) else "global"
-header = re.search(rf"(?m)^\s*\[{section}\]\s*$", text)
-if not header:
-    raise SystemExit(f"Missing [{section}] section in data/config.toml")
-next_header = re.search(r"(?m)^\s*\[", text[header.end():])
-end = header.end() + next_header.start() if next_header else len(text)
-block = text[header.start():end]
-line = f'node_name = "{node_name}"'
-if re.search(r"(?m)^\s*node_name\s*=", block):
-    block = re.sub(r"(?m)^\s*node_name\s*=.*$", line, block, count=1)
-else:
-    block = block.rstrip() + "\n" + line + "\n"
-path.write_text(text[:header.start()] + block + text[end:])
+
+def replace_in_miner(text, key, value):
+    # Locate the [miner] section and replace/insert key=value there.
+    m = re.search(r"(?m)^\s*\[miner\]\s*$", text)
+    if not m:
+        return text
+    sec_end = re.search(r"(?m)^\s*\[", text[m.end():])
+    end = m.end() + sec_end.start() if sec_end else len(text)
+    block = text[m.start():end]
+    line = f'{key} = "{value}"'
+    if re.search(rf"(?m)^\s*{key}\s*=", block):
+        block = re.sub(rf"(?m)^\s*{key}\s*=.*$", line, block, count=1)
+    else:
+        block = block.rstrip() + "\n" + line + "\n"
+    return text[:m.start()] + block + text[end:]
+
+text = replace_in_miner(text, "node_name", node_name.replace("\\", "\\\\").replace('"', '\\"'))
+text = replace_in_miner(text, "public_host", public_host.replace("\\", "\\\\").replace('"', '\\"'))
+path.write_text(text)
 PY
+    log "Config v0.3 dipertahankan; node_name dan public_host diperbarui di tempat."
+  else
+    write_v03_config
+  fi
+
+  # A v0.2-era keystore at /data/keystore.json is a different format than the
+  # v0.3 coordinator expects. On any upgrade from v0.2 archive it so the
+  # coordinator generates a fresh v0.3 keystore.
+  backup_legacy_v02
+
+  # .env: preserve operator settings, remove obsolete pins/vars.
+  if [[ ! -f .env ]]; then
+    cp env.example .env
+  fi
+
+  unset_env "QUIP_NODE_TOKEN"
+  unset_env "QUIP_NODE_URL"
+  unset_env "QUIP_VALIDATOR_RPC_URL"
+  # v0.3 images default to `latest`; remove any stale v0.2 pins from a prior
+  # one-click run so the node tracks the current build.
+  unset_env "QUIP_MINER_TAG"
+  unset_env "QUIP_DASHBOARD_TAG"
+  unset_env "QUIP_VALIDATOR_TAG"
+  unset_env "QUIP_FAUCET_TAG"
+  # v0.2-era telemetry/REST vars are gone in v0.3 (config-driven).
+  unset_env "QUIP_REST_PORT"
+  unset_env "QUIP_REST_HOST"
+  unset_env "QUIP_SIGNER_KEY"
+  unset_env "QUIP_MODE"
+  unset_env "QUIP_VALIDATORS"
+  unset_env "QUIP_FAUCET_URL"
+
+  set_env "PUID" "$(id -u "${RUN_USER}")"
+  set_env "PGID" "$(id -g "${RUN_USER}")"
+  set_env "VALIDATOR_NAME" "${NODE_NAME}"
+  set_env "QUIP_MINER_CPUSET" "0"
+  set_env "QUIP_MINER_MEM_LIMIT" "16g"
+
+  if [[ "${ENABLE_TLS}" == "yes" ]]; then
+    set_env "QUIP_HOSTNAME" "${DASHBOARD_DOMAIN}, ${DASHBOARD_DOMAIN}:${API_PORT}"
+    set_env "CERT_EMAIL" "${CERT_EMAIL}"
+  else
+    set_env "QUIP_HOSTNAME" ":${API_PORT}"
+    unset_env "CERT_EMAIL"
+    set_env "CERT_EMAIL" ""
+  fi
+
+  if [[ "${NODE_VARIANT}" == "qpu" ]]; then
+    set_env "DWAVE_API_TOKEN" "${DWAVE_API_TOKEN}"
+    set_env "DWAVE_API_KEY" "${DWAVE_API_TOKEN}"
+  fi
+
+  if [[ "${NODE_VARIANT}" == "cuda" ]]; then
+    set_env "QUIP_GPU_UTILIZATION" "100"
+  fi
+
+  chown -R "${RUN_USER}:${RUN_USER}" "${INSTALL_DIR}"
 }
 
 set_env() {
   local key="$1"
   local value="$2"
   if grep -qE "^${key}=" .env; then
-    sed -i "s|^${key}=.*|${key}=${value}|" .env
+    # Escape characters that are special in the sed replacement string so
+    # operator-supplied values (node name, domain, D-Wave token) can't corrupt
+    # the .env line.
+    local esc="${value}"
+    esc="${esc//\\/\\\\}"
+    esc="${esc//&/\\&}"
+    esc="${esc//|/\\|}"
+    sed -i "s|^${key}=.*|${key}=${esc}|" .env
   else
     echo "${key}=${value}" >> .env
   fi
@@ -435,59 +670,6 @@ set_env() {
 unset_env() {
   local key="$1"
   sed -i "/^[[:space:]]*#\\?[[:space:]]*${key}=/d" .env
-}
-
-configure_node() {
-  log "Menyiapkan konfigurasi Quip v0.2..."
-  cd "${INSTALL_DIR}"
-
-  if [[ "${EXISTING_INSTALL}" == "yes" && "${EXISTING_SCHEMA}" == "v0.1" ]]; then
-    log "Mengonversi data/config.toml v0.1 ke v0.2. Data lama akan dibackup otomatis."
-    run_config_converter
-  elif [[ ! -f data/config.toml ]]; then
-    if [[ "${NODE_VARIANT}" == "cuda" ]]; then
-      cp data/config.cuda.toml data/config.toml
-    else
-      cp data/config.cpu.toml data/config.toml
-    fi
-    if [[ "${NODE_VARIANT}" == "qpu" ]]; then
-      append_qpu_config
-    fi
-  fi
-
-  set_config_node_name
-
-  if [[ ! -f .env ]]; then
-    cp env.example .env
-  fi
-
-  unset_env "QUIP_NODE_TOKEN"
-  unset_env "DASHBOARD_PORT"
-  set_env "PUID" "$(id -u "${RUN_USER}")"
-  set_env "PGID" "$(id -g "${RUN_USER}")"
-  set_env "VALIDATOR_NAME" "${NODE_NAME}"
-  set_env "QUIP_MINER_TAG" "v0.2"
-  set_env "QUIP_DASHBOARD_TAG" "v0.2"
-  set_env "QUIP_VALIDATOR_TAG" "v0.2"
-  set_env "QUIP_VALIDATOR_RPC_URLS" "ws://quip-validator:9944"
-  # Compatibility for rolling v0.2 dashboard images that still consume the
-  # previous REST URL and singular validator RPC variables.
-  set_env "QUIP_NODE_URL" "http://quip-miner:80"
-  set_env "QUIP_VALIDATOR_RPC_URL" "ws://quip-validator:9944"
-
-  if [[ "${ENABLE_TLS}" == "yes" ]]; then
-    set_env "QUIP_HOSTNAME" "${DASHBOARD_DOMAIN}, ${DASHBOARD_DOMAIN}:${API_PORT}"
-    set_env "CERT_EMAIL" "${CERT_EMAIL}"
-  else
-    set_env "QUIP_HOSTNAME" ":${API_PORT}"
-    set_env "CERT_EMAIL" ""
-  fi
-
-  if [[ "${NODE_VARIANT}" == "qpu" ]]; then
-    set_env "DWAVE_API_KEY" "${DWAVE_API_KEY}"
-  fi
-
-  chown -R "${RUN_USER}:${RUN_USER}" "${INSTALL_DIR}"
 }
 
 tune_kernel() {
@@ -503,9 +685,8 @@ configure_firewall() {
     return
   fi
 
-  log "Memperbarui firewall ufw untuk Quip v0.2..."
+  log "Memperbarui firewall ufw untuk Quip..."
   ufw allow OpenSSH || true
-  ufw --force delete allow "${API_PORT}/udp" >/dev/null 2>&1 || true
   ufw allow "${API_PORT}/tcp"
   ufw allow "${VALIDATOR_P2P_PORT}/tcp"
   ufw allow "${VALIDATOR_P2P_PORT}/udp"
@@ -519,6 +700,10 @@ configure_firewall() {
 }
 
 start_node() {
+  if [[ "${NODE_VARIANT}" == "cuda" && "${ENABLE_MPS}" == "yes" ]]; then
+    start_host_mps
+  fi
+
   log "Memvalidasi dan menjalankan Quip profile: ${PROFILE}"
   cd "${INSTALL_DIR}"
   docker compose --profile "${PROFILE}" config >/dev/null
@@ -538,7 +723,7 @@ remove_legacy_pm2_watchdog() {
     return
   fi
   if pm2 describe quip-watchdog >/dev/null 2>&1; then
-    warn "Menghapus PM2 watchdog lama. Docker restart policy v0.2 sudah cukup."
+    warn "Menghapus PM2 watchdog lama. Docker restart policy sudah cukup."
     pm2 delete quip-watchdog || true
     pm2 save || true
   fi
@@ -548,17 +733,6 @@ install_dashboard_helper() {
   log "Menginstall terminal dashboard Quip..."
   curl -fsSL "${ONECLICK_RAW_BASE}/quip-dashboard.sh" -o /usr/local/bin/quip-dashboard
   chmod +x /usr/local/bin/quip-dashboard
-}
-
-install_dashboard_identity_sync() {
-  log "Menginstall sinkronisasi address dashboard..."
-  curl -fsSL "${ONECLICK_RAW_BASE}/quip-dashboard-sync.sh" -o /usr/local/bin/quip-dashboard-sync
-  chmod +x /usr/local/bin/quip-dashboard-sync
-  cat > /etc/cron.d/quip-dashboard-sync <<EOF
-*/5 * * * * root QUIP_INSTALL_DIR="${INSTALL_DIR}" /usr/local/bin/quip-dashboard-sync >> /var/log/quip-dashboard-sync.log 2>&1
-EOF
-  chmod 0644 /etc/cron.d/quip-dashboard-sync
-  QUIP_INSTALL_DIR="${INSTALL_DIR}" /usr/local/bin/quip-dashboard-sync || true
 }
 
 create_screen_helpers() {
@@ -595,18 +769,13 @@ print_summary() {
   echo
   log "Install atau upgrade selesai."
   echo "Folder install      : ${INSTALL_DIR}"
-  echo "Upstream branch     : ${DEPLOY_BRANCH}"
+  echo "Upstream branch     : ${DEPLOY_BRANCH} (v0.3)"
   echo "Miner variant       : ${NODE_VARIANT}"
   echo "Compose profile     : ${PROFILE}"
   echo "Public API          : ${API_PORT}/tcp"
   echo "Validator libp2p    : ${VALIDATOR_P2P_PORT}/tcp + ${VALIDATOR_P2P_PORT}/udp"
   echo "Config              : ${INSTALL_DIR}/data/config.toml"
   echo "Env                 : ${INSTALL_DIR}/.env"
-
-  if [[ "${EXISTING_SCHEMA}" == "v0.1" ]]; then
-    echo "Backup config lama  : ${INSTALL_DIR}/data/.v0.1_backup/"
-    echo "Backup env lama     : ${INSTALL_DIR}/.env.v0.1_backup"
-  fi
 
   if [[ "${ENABLE_TLS}" == "yes" ]]; then
     echo "Dashboard           : https://${DASHBOARD_DOMAIN}/"
@@ -620,9 +789,7 @@ print_summary() {
   echo "  docker compose --profile ${PROFILE} ps"
   echo "  docker compose logs --tail=200 -f ${PROFILE}"
   echo "  docker compose logs --tail=200 -f quip-validator"
-  echo "  docker compose logs --tail=200 -f quip-bootstrap"
   echo "  quip-dashboard     # dashboard status + logs, refresh tiap 5 detik"
-  echo "  quip-dashboard-sync # sinkronkan Connected Node dengan miner lokal"
   echo "  bash ./cron.sh"
   if [[ "${ENABLE_SCREEN}" == "yes" ]]; then
     echo "  quip-logs          # buka logs di screen"
@@ -640,15 +807,22 @@ main() {
   install_docker
   detect_existing_install
   collect_inputs
-  stop_legacy_containers
+
+  # CUDA profile requires the docker `nvidia` runtime (NVIDIA Container Toolkit).
+  if [[ "${NODE_VARIANT}" == "cuda" ]]; then
+    install_nvidia_container_toolkit
+  fi
+
+  # Update the deployment repo first so a git failure leaves the running stack
+  # untouched; only then tear the old containers down.
   clone_or_update_repo
+  stop_legacy_containers
   configure_node
   tune_kernel
   configure_firewall
   remove_legacy_pm2_watchdog
   install_dashboard_helper
   start_node
-  install_dashboard_identity_sync
   install_cron_update
   create_screen_helpers
   print_summary

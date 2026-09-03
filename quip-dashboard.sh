@@ -5,6 +5,10 @@ INSTALL_DIR="${QUIP_INSTALL_DIR:-/opt/quip-node}"
 REFRESH_SECONDS="${QUIP_DASHBOARD_REFRESH:-5}"
 LOG_LINES="${QUIP_DASHBOARD_LOG_LINES:-8}"
 DASHBOARD_ONCE="${QUIP_DASHBOARD_ONCE:-0}"
+# Miner REST is proxied by Caddy at /api/v1/* -> quip-miner:8086. Reach it
+# through the public/API port on the loopback host for status checks.
+API_PORT="20049"
+REST_BASE="http://127.0.0.1:${API_PORT}"
 
 GREEN="\033[0;32m"
 YELLOW="\033[1;33m"
@@ -132,26 +136,51 @@ render_sync_status() {
   PREV_TIME="${now}"
 }
 
-render_miner_activity() {
+# Detect which miner backend is running (v0.3 images both live under
+# container names quip-cpu / quip-cuda like v0.2).
+detect_miner_container() {
   local container="quip-cpu"
-  local line
-
   if docker inspect quip-cuda >/dev/null 2>&1; then
     container="quip-cuda"
   fi
+  printf "%s" "${container}"
+}
+
+miner_rest_status() {
+  # v0.3 coordinator is a Rust binary; there is no python3 inside. Query the
+  # proxied REST instead. In dev/no-TLS mode Caddy serves it at :20049.
+  curl -fsSL --max-time 5 "${REST_BASE}/api/v1/status" 2>/dev/null || true
+}
+
+render_miner_activity() {
+  local container miner_line ss58 is_mining
+  container="$(detect_miner_container)"
 
   if ! docker inspect "${container}" >/dev/null 2>&1; then
     printf "Miner activity      : ${YELLOW}waiting for miner container${NC}\n"
     return
   fi
 
-  line="$(docker logs --tail 300 "${container}" 2>&1 |
-    grep -E 'mine_work_item|participation remark submitted|mining continues' |
+  # Coordinator/validator logs give the live mining picture in v0.3.
+  miner_line="$(docker logs --tail 300 "${container}" 2>&1 |
+    grep -iE 'submitting proof|proof submitted|accepted|mining|dispatch|attempt' |
     tail -n 1 || true)"
 
-  if [[ -n "${line}" ]]; then
+  local status
+  status="$(miner_rest_status "${container}")"
+  if [[ -n "${status}" ]]; then
+    ss58="$(printf '%s' "${status}" | sed -nE 's/.*"ss58_address":"([^"]+)".*/\1/p' | head -n1)"
+    is_mining="$(printf '%s' "${status}" | sed -nE 's/.*"is_mining":(true|false).*/\1/p' | head -n1)"
+    [[ -z "${ss58}" ]] && ss58="(no signer yet)"
+    [[ -z "${is_mining}" ]] && is_mining="unknown"
+    printf "Miner REST          : ${GREEN}reachable${NC} (ss58: %s, is_mining: %s)\n" "${ss58}" "${is_mining}"
+  else
+    printf "Miner REST          : ${YELLOW}not reachable yet${NC}\n"
+  fi
+
+  if [[ -n "${miner_line}" ]]; then
     printf "Miner activity      : ${GREEN}active${NC}\n"
-    printf "Latest miner event  : %s\n" "${line}"
+    printf "Latest miner event  : %s\n" "${miner_line}"
   else
     printf "Miner activity      : ${YELLOW}running, waiting for mining event${NC}\n"
   fi
@@ -177,7 +206,6 @@ render() {
 
   printf "${BOLD}${BLUE}== Container Status ==${NC}\n"
   printf "validator           : %b\n" "$(container_state quip-validator)"
-  printf "bootstrap           : %b\n" "$(container_state quip-bootstrap)"
   printf "miner cpu           : %b\n" "$(container_state quip-cpu)"
   printf "miner cuda          : %b\n" "$(container_state quip-cuda)"
   printf "dashboard           : %b\n" "$(container_state quip-dashboard)"
@@ -196,7 +224,6 @@ render() {
   else
     render_logs "CPU Mining Logs" "quip-cpu"
   fi
-  render_logs "Bootstrap Logs" "quip-bootstrap"
 }
 
 if [[ ! -d "${INSTALL_DIR}" ]]; then
